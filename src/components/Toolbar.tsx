@@ -13,6 +13,7 @@ import {
   Redo2,
   Download,
   Upload,
+  FilePlus,
   Maximize2,
   ZoomIn,
   ZoomOut,
@@ -33,6 +34,7 @@ export type ActiveToolMode =
 export interface ToolbarProps {
   activePresetId: string;
   onSelectPreset: (presetId: string) => void;
+  onNewProject: () => void;
   activeTool: ActiveToolMode;
   onSelectTool: (tool: ActiveToolMode) => void;
   canUndo: boolean;
@@ -53,6 +55,7 @@ export interface ToolbarProps {
 export function Toolbar({
   activePresetId,
   onSelectPreset,
+  onNewProject,
   activeTool,
   onSelectTool,
   canUndo,
@@ -105,38 +108,59 @@ export function Toolbar({
   return (
     <header
       id="app-top-toolbar"
-      className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-slate-900/95 border-b border-slate-800 text-slate-100 select-none z-20"
+      className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-white border-b border-slate-200 text-slate-900 shadow-xs select-none z-20"
     >
-      {/* Left: Brand & Benchmark Preset Selector */}
-      <div className="flex items-center gap-3">
-        <div className="flex items-center gap-2 pr-2 border-r border-slate-800">
-          <div className="w-8 h-8 rounded-lg bg-sky-500/15 border border-sky-400/40 flex items-center justify-center text-sky-400">
+      {/* Left: Brand, New Blank Project Button & Benchmark Preset Selector */}
+      <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2 pr-2.5 border-r border-slate-200">
+          <div className="w-8 h-8 rounded-lg bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600">
             <Boxes size={18} />
           </div>
           <div>
-            <h1 className="text-xs font-bold tracking-wider uppercase text-slate-100 leading-tight">
+            <h1 className="text-xs font-bold tracking-wider uppercase text-slate-900 leading-tight">
               FEM Studio 2D
             </h1>
-            <p className="text-[10px] font-mono text-slate-400 leading-tight">
+            <p className="text-[10px] font-mono text-slate-500 leading-tight">
               6-DOF Euler-Bernoulli · SI
             </p>
           </div>
         </div>
 
+        {/* New Blank Project Button */}
+        <button
+          id="btn-new-project"
+          type="button"
+          onClick={onNewProject}
+          title="New Blank Project (Clears workspace to empty 0.1 m grid; Undo with Ctrl+Z)"
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold bg-slate-50 hover:bg-slate-100 text-slate-700 hover:text-slate-900 border border-slate-300 transition-colors cursor-pointer shadow-2xs"
+        >
+          <FilePlus size={14} className="text-blue-600" />
+          <span>New</span>
+        </button>
+
         {/* Benchmark Presets Dropdown */}
         <div className="flex items-center gap-1.5">
           <label
             htmlFor="preset-benchmark-select"
-            className="text-[11px] font-medium text-slate-400 hidden sm:inline"
+            className="text-[11px] font-medium text-slate-500 hidden sm:inline"
           >
-            Benchmark:
+            Preset:
           </label>
           <select
             id="preset-benchmark-select"
             value={activePresetId}
-            onChange={(e: any) => onSelectPreset(e.target.value)}
-            className="bg-slate-800/90 hover:bg-slate-800 text-slate-100 text-xs font-medium rounded-md px-2.5 py-1.5 border border-slate-700 focus:outline-none focus:border-sky-400 transition-colors cursor-pointer"
+            onChange={(e: any) => {
+              if (e.target.value === 'blank') {
+                onNewProject();
+              } else {
+                onSelectPreset(e.target.value);
+              }
+            }}
+            className="bg-slate-50 hover:bg-slate-100 text-slate-800 text-xs font-medium rounded-md px-2.5 py-1.5 border border-slate-300 focus:outline-none focus:border-blue-500 transition-colors cursor-pointer"
           >
+            {activePresetId === 'blank' ? (
+              <option value="blank">Blank Workspace (0.1 m Grid)</option>
+            ) : null}
             {BENCHMARK_PRESETS.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.title} ({p.badge})
@@ -147,7 +171,7 @@ export function Toolbar({
       </div>
 
       {/* Center: Interactive CAD Modeling Tools */}
-      <div className="flex items-center gap-1 bg-slate-950/80 p-1 rounded-lg border border-slate-800">
+      <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200">
         {tools.map((t) => {
           const IconComp = t.icon;
           const active = activeTool === t.id;
@@ -159,17 +183,21 @@ export function Toolbar({
               type="button"
               onClick={() => onSelectTool(t.id)}
               title={`${t.label} (${t.shortcut})`}
-              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium transition-all cursor-pointer ${
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold transition-all cursor-pointer ${
                 active
                   ? isDelete
-                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/50 shadow-sm'
-                    : 'bg-sky-500/20 text-sky-300 border border-sky-400/50 shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70 border border-transparent'
+                    ? 'bg-red-600 text-white border border-red-600 shadow-xs'
+                    : 'bg-blue-600 text-white border border-blue-600 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white border border-transparent'
               }`}
             >
               <IconComp size={14} />
               <span className="hidden md:inline">{t.label}</span>
-              <span className="text-[10px] font-mono opacity-60 hidden lg:inline">
+              <span
+                className={`text-[10px] font-mono hidden lg:inline ${
+                  active ? 'text-blue-100' : 'text-slate-400'
+                }`}
+              >
                 [{t.shortcut}]
               </span>
             </button>
@@ -183,25 +211,25 @@ export function Toolbar({
         {solverOutput.stable ? (
           <div
             id="solver-status-badge"
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-mono"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-300 text-emerald-700 text-xs font-mono"
             title={solverOutput.statusMessage}
           >
-            <CheckCircle2 size={13} />
+            <CheckCircle2 size={13} className="text-emerald-600" />
             <span className="font-semibold">Stable</span>
           </div>
         ) : (
           <div
             id="solver-status-badge"
-            className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-rose-500/25 border border-rose-500 text-rose-200 text-xs font-mono animate-pulse"
-            title={solverOutput.instabilityReason || 'Mechanism detected'}
+            className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-red-50 border border-red-400 text-red-700 text-xs font-mono"
+            title={solverOutput.instabilityReason || 'Mechanism or empty structure'}
           >
-            <AlertTriangle size={14} className="text-rose-400" />
+            <AlertTriangle size={14} className="text-red-600" />
             <span className="font-bold tracking-wide uppercase">Unstable Structure</span>
           </div>
         )}
 
         {/* Undo / Redo */}
-        <div className="flex items-center bg-slate-800/70 rounded-md border border-slate-700/80 p-0.5">
+        <div className="flex items-center bg-slate-100 rounded-md border border-slate-200 p-0.5">
           <button
             id="btn-undo"
             type="button"
@@ -210,8 +238,8 @@ export function Toolbar({
             title="Undo (Ctrl+Z)"
             className={`p-1.5 rounded transition-colors ${
               canUndo
-                ? 'text-slate-200 hover:bg-slate-700 cursor-pointer'
-                : 'text-slate-600 cursor-not-allowed'
+                ? 'text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer'
+                : 'text-slate-300 cursor-not-allowed'
             }`}
           >
             <Undo2 size={14} />
@@ -224,8 +252,8 @@ export function Toolbar({
             title="Redo (Ctrl+Y)"
             className={`p-1.5 rounded transition-colors ${
               canRedo
-                ? 'text-slate-200 hover:bg-slate-700 cursor-pointer'
-                : 'text-slate-600 cursor-not-allowed'
+                ? 'text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer'
+                : 'text-slate-300 cursor-not-allowed'
             }`}
           >
             <Redo2 size={14} />
@@ -233,13 +261,13 @@ export function Toolbar({
         </div>
 
         {/* Zoom & Polar/Cartesian Overlay Controls */}
-        <div className="flex items-center bg-slate-800/70 rounded-md border border-slate-700/80 p-0.5">
+        <div className="flex items-center bg-slate-100 rounded-md border border-slate-200 p-0.5">
           <button
             id="btn-zoom-in"
             type="button"
             onClick={onZoomIn}
             title="Zoom In"
-            className="p-1.5 rounded text-slate-200 hover:bg-slate-700 cursor-pointer"
+            className="p-1.5 rounded text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer"
           >
             <ZoomIn size={14} />
           </button>
@@ -248,7 +276,7 @@ export function Toolbar({
             type="button"
             onClick={onZoomOut}
             title="Zoom Out"
-            className="p-1.5 rounded text-slate-200 hover:bg-slate-700 cursor-pointer"
+            className="p-1.5 rounded text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer"
           >
             <ZoomOut size={14} />
           </button>
@@ -257,7 +285,7 @@ export function Toolbar({
             type="button"
             onClick={onFitView}
             title="Fit Structure to Viewport"
-            className="p-1.5 rounded text-slate-200 hover:bg-slate-700 cursor-pointer"
+            className="p-1.5 rounded text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer"
           >
             <Maximize2 size={14} />
           </button>
@@ -268,8 +296,8 @@ export function Toolbar({
             title="Toggle Cartesian (x,y) vs Polar (r,θ) Coordinate Overlay"
             className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono cursor-pointer transition-colors ${
               coordSystem === 'polar'
-                ? 'bg-sky-500/25 text-sky-300'
-                : 'text-slate-300 hover:bg-slate-700'
+                ? 'bg-blue-600 text-white font-semibold'
+                : 'text-slate-700 hover:bg-white hover:text-slate-900'
             }`}
           >
             <Compass size={13} />
@@ -277,27 +305,27 @@ export function Toolbar({
           </button>
         </div>
 
-        {/* JSON Export / Import */}
-        <div className="flex items-center bg-slate-800/70 rounded-md border border-slate-700/80 p-0.5">
-          <button
-            id="btn-export-json"
-            type="button"
-            onClick={onExportJson}
-            title="Export Model as JSON"
-            className="flex items-center gap-1 px-2 py-1 rounded text-xs text-slate-200 hover:bg-slate-700 cursor-pointer"
-          >
-            <Download size={13} />
-            <span className="hidden xl:inline">Export</span>
-          </button>
+        {/* JSON Import (Upload) / Export (Download) */}
+        <div className="flex items-center bg-slate-100 rounded-md border border-slate-200 p-0.5">
           <button
             id="btn-import-json"
             type="button"
             onClick={() => fileInputRef.current?.click()}
             title="Import Model from JSON"
-            className="flex items-center gap-1 px-2 py-1 rounded text-xs text-slate-200 hover:bg-slate-700 cursor-pointer"
+            className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer"
           >
-            <Upload size={13} />
-            <span className="hidden xl:inline">Import</span>
+            <Upload size={13} className="text-blue-600" />
+            <span>Import</span>
+          </button>
+          <button
+            id="btn-export-json"
+            type="button"
+            onClick={onExportJson}
+            title="Export Model as JSON"
+            className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer"
+          >
+            <Download size={13} className="text-emerald-600" />
+            <span>Export</span>
           </button>
           <input
             ref={fileInputRef}
@@ -311,3 +339,4 @@ export function Toolbar({
     </header>
   );
 }
+

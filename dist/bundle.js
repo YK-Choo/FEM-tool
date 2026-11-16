@@ -7,8 +7,8 @@ __modules.__mod_0 = (function() {
   /**
  * Lightweight, Fine-Grained React 18-Compatible VDOM Runtime & Hooks Engine
  *
- * Preserves DOM nodes (<canvas>, focused <input>, active range sliders, SVG icons)
- * across state updates for smooth 60fps CAD interaction and real-time sensitivity sliders.
+ * Keyed by virtual tree path (`__vpath`) so conditional siblings (`{cond ? <Popup/> : null}`)
+ * never shift hook state paths or remount persistent DOM nodes like `<canvas>` or `<input>`.
  */
 
 const Fragment = Symbol.for('react.fragment');
@@ -29,23 +29,13 @@ function createElement(
   const key = normalizedProps.key !== undefined ? normalizedProps.key : null;
   delete normalizedProps.key;
 
-  const flatChildren        = [];
-  const flatten = (arr       ) => {
-    for (const item of arr) {
-      if (Array.isArray(item)) {
-        flatten(item);
-      } else if (item !== null && item !== undefined && item !== false && item !== true) {
-        flatChildren.push(item);
-      }
-    }
-  };
-  flatten(rawChildren);
-
-  normalizedProps.children = flatChildren;
+  // Keep rawChildren structure (including null/boolean slots) so positional child indices
+  // never shift when a conditional expression toggles between null and an element!
+  normalizedProps.children = rawChildren;
   return {
     type,
     props: normalizedProps,
-    children: flatChildren,
+    children: rawChildren,
     key,
   };
 }
@@ -74,7 +64,9 @@ function flushSyncRender() {
   if (activeRootRender) activeRootRender();
 }
 
-function useState   (initialValue               )                                            {
+function useState   (
+  initialValue               
+)                                            {
   if (!currentInstance) throw new Error('useState called outside component');
   const inst = currentInstance;
   const idx = inst.hookIndex++;
@@ -179,7 +171,6 @@ const SVG_ATTR_MAP                         = {
   dominantBaseline: 'dominant-baseline',
 };
 
-// Expand functional components and fragments into concrete DOM-ready VNodes
 const componentInstances = new Map                           ();
 let usedPathsInPass = new Set        ();
 let pendingEffectsQueue                    = [];
@@ -193,10 +184,12 @@ function expandVNode(node     , path        )        {
   }
   if (Array.isArray(node)) {
     const res        = [];
-    node.forEach((child, i) => {
-      const k = child && typeof child === 'object' && child.key != null ? `k:${child.key}` : `i:${i}`;
+    for (let i = 0; i < node.length; i++) {
+      const child = node[i];
+      const k =
+        child && typeof child === 'object' && child.key != null ? `k:${child.key}` : `i:${i}`;
       res.push(...expandVNode(child, `${path}/${k}`));
-    });
+    }
     return res;
   }
   if (node.type === Fragment) {
@@ -231,12 +224,14 @@ function expandVNode(node     , path        )        {
     return expandVNode(rendered, instKey);
   }
 
-  // Native DOM element
+  // Native DOM element: preserve slot index `i` across all rawChildren (even null slots)
   const expandedChildren        = [];
-  node.children.forEach((child     , i        ) => {
-    const k = child && typeof child === 'object' && child.key != null ? `k:${child.key}` : `i:${i}`;
+  for (let i = 0; i < node.children.length; i++) {
+    const child = node.children[i];
+    const k =
+      child && typeof child === 'object' && child.key != null ? `k:${child.key}` : `s:${i}`;
     expandedChildren.push(...expandVNode(child, `${path}/${node.type}/${k}`));
-  });
+  }
 
   return [
     {
@@ -244,7 +239,7 @@ function expandVNode(node     , path        )        {
       props: node.props,
       children: expandedChildren,
       key: node.key,
-      path,
+      path: `${path}/${node.type}`,
     },
   ];
 }
@@ -258,15 +253,23 @@ function applyProps(
   const prevListeners                      = (dom       ).__listeners || {};
   (dom       ).__listeners = prevListeners;
 
-  // Remove old props
   for (const k of Object.keys(prevProps)) {
     if (k === 'children' || k === 'ref') continue;
     if (!(k in nextProps)) {
       if (k.startsWith('on') && k.length > 2) {
-        const evt = k.slice(2).toLowerCase();
-        if (prevListeners[evt]) {
-          dom.removeEventListener(evt, prevListeners[evt]);
-          delete prevListeners[evt];
+        const rawName = k.slice(2).toLowerCase();
+        const evtName =
+          rawName === 'change' &&
+          (dom.tagName === 'INPUT' || dom.tagName === 'TEXTAREA') &&
+          (dom                    ).type !== 'checkbox' &&
+          (dom                    ).type !== 'file'
+            ? 'input'
+            : rawName === 'doubleclick'
+              ? 'dblclick'
+              : rawName;
+        if (prevListeners[evtName]) {
+          dom.removeEventListener(evtName, prevListeners[evtName]);
+          delete prevListeners[evtName];
         }
       } else if (k === 'className') {
         dom.removeAttribute('class');
@@ -278,7 +281,6 @@ function applyProps(
     }
   }
 
-  // Set new/updated props
   for (const [k, val] of Object.entries(nextProps)) {
     if (k === 'children') continue;
     if (k === 'ref') {
@@ -291,7 +293,6 @@ function applyProps(
     }
 
     if (k.startsWith('on') && k.length > 2 && typeof val === 'function') {
-      // Map React's onChange on <input>/<select>/<textarea> to both 'input' and 'change' for instant live updates
       const rawName = k.slice(2).toLowerCase();
       const evtName =
         rawName === 'change' &&
@@ -361,42 +362,54 @@ function applyProps(
   }
 }
 
-function reconcileChildren(
-  parentDom      ,
-  nextVNodes       ,
-  isSvgContext         
-) {
+/**
+ * Reconcile children by matching existing DOM nodes via `__vpath` first (falling back to index/tag),
+ * so inserting/removing conditional banners or pop-ups never destroys sibling `<canvas>` or `<input>` elements.
+ */
+function reconcileChildren(parentDom      , nextVNodes       , isSvgContext         ) {
   const existingNodes = Array.from(parentDom.childNodes);
+  const byPath = new Map              ();
+  for (const n of existingNodes) {
+    const p = (n       ).__vpath;
+    if (p) byPath.set(p, n);
+  }
+
+  const usedDomNodes = new Set      ();
+  const resolvedDomNodes         = [];
 
   for (let i = 0; i < nextVNodes.length; i++) {
     const vnode = nextVNodes[i];
-    const existing = existingNodes[i];
+    let matched = byPath.get(vnode.path);
+
+    if (matched && usedDomNodes.has(matched)) {
+      matched = undefined;
+    }
 
     if (vnode.type === '#text') {
-      if (existing && existing.nodeType === Node.TEXT_NODE) {
-        if (existing.nodeValue !== vnode.text) {
-          existing.nodeValue = vnode.text;
+      let textNode      ;
+      if (matched && matched.nodeType === Node.TEXT_NODE) {
+        textNode = matched;
+        if (textNode.nodeValue !== vnode.text) {
+          textNode.nodeValue = vnode.text;
         }
       } else {
-        const textNode = document.createTextNode(vnode.text);
-        if (existing) {
-          parentDom.replaceChild(textNode, existing);
-        } else {
-          parentDom.appendChild(textNode);
-        }
+        textNode = document.createTextNode(vnode.text);
       }
+      (textNode       ).__vpath = vnode.path;
+      usedDomNodes.add(textNode);
+      resolvedDomNodes.push(textNode);
       continue;
     }
 
     const isSvg = isSvgContext || SVG_TAGS.has(vnode.type);
     const tagMatch =
-      existing &&
-      existing.nodeType === Node.ELEMENT_NODE &&
-      (existing           ).tagName.toLowerCase() === vnode.type.toLowerCase();
+      matched &&
+      matched.nodeType === Node.ELEMENT_NODE &&
+      (matched           ).tagName.toLowerCase() === vnode.type.toLowerCase();
 
     let domEl                          ;
     if (tagMatch) {
-      domEl = existing                            ;
+      domEl = matched                            ;
       const prevProps = (domEl       ).__vprops || {};
       applyProps(domEl, vnode.props, prevProps, isSvg);
       (domEl       ).__vprops = vnode.props;
@@ -406,16 +419,14 @@ function reconcileChildren(
         : document.createElement(vnode.type);
       applyProps(domEl, vnode.props, {}, isSvg);
       (domEl       ).__vprops = vnode.props;
-      if (existing) {
-        parentDom.replaceChild(domEl, existing);
-      } else {
-        parentDom.appendChild(domEl);
-      }
     }
+
+    (domEl       ).__vpath = vnode.path;
+    usedDomNodes.add(domEl);
+    resolvedDomNodes.push(domEl);
 
     reconcileChildren(domEl, vnode.children, isSvg);
 
-    // Ensure <select> reflects its controlled value after <option> children are reconciled
     if (!isSvg && vnode.type === 'select' && vnode.props.value !== undefined) {
       const selStr = String(vnode.props.value);
       if ((domEl                     ).value !== selStr) {
@@ -424,43 +435,69 @@ function reconcileChildren(
     }
   }
 
-  // Remove any extra trailing DOM nodes
-  while (parentDom.childNodes.length > nextVNodes.length) {
-    const last = parentDom.lastChild;
-    if (last) parentDom.removeChild(last);
+  // Remove any old DOM nodes that are no longer in resolvedDomNodes
+  for (const oldNode of existingNodes) {
+    if (!usedDomNodes.has(oldNode)) {
+      parentDom.removeChild(oldNode);
+    }
+  }
+
+  // Ensure exact DOM order without disturbing already-ordered persistent nodes (like <canvas>)
+  for (let i = 0; i < resolvedDomNodes.length; i++) {
+    const desired = resolvedDomNodes[i];
+    const currentAtI = parentDom.childNodes[i];
+    if (currentAtI !== desired) {
+      if (typeof (parentDom       ).insertBefore === 'function') {
+        parentDom.insertBefore(desired, currentAtI || null);
+      } else {
+        parentDom.appendChild(desired);
+      }
+    }
   }
 }
 
 function createRoot(container             ) {
   let rootVNode      = null;
+  let isRendering = false;
+  let dirtyDuringRender = false;
 
   const performRender = () => {
     if (!rootVNode) return;
-    usedPathsInPass = new Set        ();
-    pendingEffectsQueue = [];
+    if (isRendering) {
+      dirtyDuringRender = true;
+      return;
+    }
+    isRendering = true;
+    try {
+      do {
+        dirtyDuringRender = false;
+        usedPathsInPass = new Set        ();
+        pendingEffectsQueue = [];
 
-    const expanded = expandVNode(rootVNode, 'root');
-    reconcileChildren(container, expanded, false);
+        const expanded = expandVNode(rootVNode, 'root');
+        reconcileChildren(container, expanded, false);
 
-    // Cleanup unmounted component instances
-    for (const [k, inst] of componentInstances.entries()) {
-      if (!usedPathsInPass.has(k)) {
-        for (const h of inst.hooks) {
-          if (h && typeof h.cleanup === 'function') {
-            try {
-              h.cleanup();
-            } catch {}
+        for (const [k, inst] of componentInstances.entries()) {
+          if (!usedPathsInPass.has(k)) {
+            for (const h of inst.hooks) {
+              if (h && typeof h.cleanup === 'function') {
+                try {
+                  h.cleanup();
+                } catch {}
+              }
+            }
+            componentInstances.delete(k);
           }
         }
-        componentInstances.delete(k);
-      }
-    }
 
-    // Run queued useEffects
-    const effects = [...pendingEffectsQueue];
-    pendingEffectsQueue = [];
-    for (const eff of effects) {
-      eff();
+        const effects = [...pendingEffectsQueue];
+        pendingEffectsQueue = [];
+        for (const eff of effects) {
+          eff();
+        }
+      } while (dirtyDuringRender);
+    } finally {
+      isRendering = false;
     }
   };
 
@@ -2203,7 +2240,12 @@ function computeSmartSnap(
 }
 
 /**
- * Compute a balanced ViewportTransform that centers and fits the structural model.
+ * Compute a balanced ViewportTransform that centers and fits the structural model
+ * inside the usable canvas area (after subtracting toolbar and right sensitivity panel).
+ * - If nodes is empty (0 nodes), resets the view cleanly to show x in [-1 m, 10 m], y in [-2 m, 6 m].
+ * - Enforces a minimum span of 2.0 m on both X and Y so degenerate single-line structures
+ *   (purely horizontal beams where maxY === minY or vertical columns where maxX === minX)
+ *   never produce Infinity or NaN scale.
  */
 function fitModelToViewport(
   nodes                  ,
@@ -2211,53 +2253,83 @@ function fitModelToViewport(
   height        ,
   current                             
 )                    {
+  const safeW = Math.max(width, 320);
+  const safeH = Math.max(height, 240);
+
   const base                    = {
-    panX: width * 0.25,
-    panY: height * 0.65,
+    panX: safeW * 0.25,
+    panY: safeH * 0.65,
     zoom: 70,
-    width,
-    height,
+    width: safeW,
+    height: safeH,
     coordSystem: current?.coordSystem ?? 'cartesian',
     polarOrigin: current?.polarOrigin ?? { x: 0, y: 0 },
   };
 
-  if (nodes.length === 0 || width <= 0 || height <= 0) {
-    return base;
+  let minX = -1;
+  let maxX = 10;
+  let minY = -2;
+  let maxY = 6;
+
+  if (nodes.length > 0) {
+    minX = Infinity;
+    maxX = -Infinity;
+    minY = Infinity;
+    maxY = -Infinity;
+
+    for (const n of nodes) {
+      if (Number.isFinite(n.x)) {
+        if (n.x < minX) minX = n.x;
+        if (n.x > maxX) maxX = n.x;
+      }
+      if (Number.isFinite(n.y)) {
+        if (n.y < minY) minY = n.y;
+        if (n.y > maxY) maxY = n.y;
+      }
+    }
+
+    if (!Number.isFinite(minX) || !Number.isFinite(maxX)) {
+      minX = -1;
+      maxX = 10;
+    }
+    if (!Number.isFinite(minY) || !Number.isFinite(maxY)) {
+      minY = -2;
+      maxY = 6;
+    }
   }
 
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
+  // Enforce minimum span of 2.0 m so horizontal beams (maxY === minY) or vertical columns
+  // (maxX === minX) never produce Infinity or NaN zoom.
+  const spanX = Math.max(maxX - minX, 2.0);
+  const spanY = Math.max(maxY - minY, 2.0);
 
-  for (const n of nodes) {
-    if (n.x < minX) minX = n.x;
-    if (n.x > maxX) maxX = n.x;
-    if (n.y < minY) minY = n.y;
-    if (n.y > maxY) maxY = n.y;
-  }
+  // Account for floating layer toggle bar at top (~56px) and bottom status bar (~36px)
+  // plus comfortable margin around support symbols and load arrows.
+  const padX = Math.min(160, safeW * 0.22);
+  const padY = Math.min(170, safeH * 0.28);
+  const usableW = Math.max(safeW - padX, safeW * 0.65);
+  const usableH = Math.max(safeH - padY, safeH * 0.60);
 
-  const spanX = Math.max(maxX - minX, 3.0);
-  const spanY = Math.max(maxY - minY, 2.5);
-
-  const usableW = Math.max(width - 240, width * 0.62);
-  const usableH = Math.max(height - 220, height * 0.58);
-
-  const zoom = Math.min(
-    180,
-    Math.max(24, Math.min(usableW / spanX, usableH / spanY))
-  );
+  const rawZoom = Math.min(usableW / spanX, usableH / spanY);
+  const zoom = Number.isFinite(rawZoom)
+    ? Math.min(180, Math.max(24, rawZoom))
+    : 70;
 
   const centerX = (minX + maxX) * 0.5;
   const centerY = (minY + maxY) * 0.5;
 
+  // Vertical center slightly shifted down by 10px to clear the top floating overlay bar
+  const visualCenterX = safeW * 0.5;
+  const visualCenterY = safeH * 0.52;
+
   return {
     ...base,
     zoom,
-    panX: width * 0.5 - centerX * zoom,
-    panY: height * 0.54 + centerY * zoom,
+    panX: visualCenterX - centerX * zoom,
+    panY: visualCenterY + centerY * zoom,
   };
 }
+
 
 
 
@@ -2662,68 +2734,171 @@ function canAddMember(
 }
 
 /**
- * Hit-test the canvas in priority order:
- * 1. Load handles / arrows / labels (so clicking any Load opens the Load editor pop-up)
- * 2. Nodes (so clicking any Node opens the Node editor pop-up)
- * 3. Members (so clicking any Member opens the Member editor pop-up)
+ * Find the closest StructuralNode within radiusPx (default 16 px) in screen space.
+ * Used by Assign Support and Add Nodal Load tools so clicking near a node reliably hits it
+ * even if load arrows or member lines overlap the node.
  */
-function hitTestCanvas(
+function findNodeWithinRadius(
+  sx        ,
+  sy        ,
+  vp                   ,
+  nodes                  ,
+  radiusPx         = 16
+)                                                                                        {
+  let bestNode                        = null;
+  let bestDist = radiusPx;
+  let bestSc = { sx: 0, sy: 0 };
+
+  for (const n of nodes) {
+    const sc = worldToScreen(n, vp);
+    const d = Math.hypot(sx - sc.sx, sy - sc.sy);
+    if (d <= bestDist) {
+      bestDist = d;
+      bestNode = n;
+      bestSc = sc;
+    }
+  }
+
+  if (!bestNode) return null;
+  return {
+    node: bestNode,
+    screenX: bestSc.sx,
+    screenY: bestSc.sy,
+    distancePx: bestDist,
+  };
+}
+
+/**
+ * Return all overlapping entities at (sx, sy) in deterministic click-through cycling order:
+ *   Node -> Nodal Load #1 -> Nodal Load #2 (etc.) -> Connected Member(s) -> (cycles back to Node)
+ * Also includes any non-nodal Load handle or Member segment directly under the cursor.
+ */
+function hitTestAllCanvasEntities(
   sx        ,
   sy        ,
   vp                   ,
   model                 ,
   loadHandles                                                   
-)                         {
+)                    {
+  const targets                    = [];
+  const addedLoadIds = new Set        ();
+  const addedMemberIds = new Set        ();
+
   const nodeMap = new Map                        ();
   for (const n of model.nodes) nodeMap.set(n.id, n);
 
-  // 1. Check Load interactive handles first (within 15px)
-  let bestLoad                                                    = null;
-  let bestLoadDist = 15;
+  // 1. Check if cursor is over a Node (within 16 px)
+  const nodeHit = findNodeWithinRadius(sx, sy, vp, model.nodes, 16);
+  if (nodeHit) {
+    const n = nodeHit.node;
+    targets.push({
+      kind: 'node',
+      nodeId: n.id,
+      screenX: nodeHit.screenX,
+      screenY: nodeHit.screenY,
+    });
+
+    // All Nodal Loads attached to this node (in model order)
+    for (const ld of model.loads) {
+      if (ld.kind === 'nodal' && ld.nodeId === n.id) {
+        addedLoadIds.add(ld.id);
+        targets.push({
+          kind: 'load',
+          loadId: ld.id,
+          screenX: nodeHit.screenX,
+          screenY: nodeHit.screenY,
+        });
+      }
+    }
+
+    // Also any load handle within 16 px of the click
+    for (const lh of loadHandles) {
+      if (!addedLoadIds.has(lh.loadId) && Math.hypot(sx - lh.sx, sy - lh.sy) <= 16) {
+        addedLoadIds.add(lh.loadId);
+        targets.push({
+          kind: 'load',
+          loadId: lh.loadId,
+          screenX: lh.sx,
+          screenY: lh.sy,
+        });
+      }
+    }
+
+    // All Connected Members attached to this node
+    for (const el of model.elements) {
+      if (el.kind === 'frame2d' && (el.nodeI === n.id || el.nodeJ === n.id)) {
+        addedMemberIds.add(el.id);
+        targets.push({
+          kind: 'member',
+          elementId: el.id,
+          screenX: nodeHit.screenX,
+          screenY: nodeHit.screenY,
+        });
+      }
+    }
+
+    return targets;
+  }
+
+  // 2. Not on a node: check Load interactive handles (within 16 px)
+  const matchingLoads                                                                  = [];
   for (const lh of loadHandles) {
     const d = Math.hypot(sx - lh.sx, sy - lh.sy);
-    if (d <= bestLoadDist) {
-      bestLoadDist = d;
-      bestLoad = lh;
+    if (d <= 16 && !addedLoadIds.has(lh.loadId)) {
+      addedLoadIds.add(lh.loadId);
+      matchingLoads.push({ ...lh, dist: d });
     }
   }
-  if (bestLoad) {
-    return {
+  matchingLoads.sort((a, b) => a.dist - b.dist);
+  for (const ml of matchingLoads) {
+    // If this load handle belongs to a NodalLoad, also include its parent Node and sibling NodalLoads for easy cycling!
+    const ldObj = model.loads.find((l) => l.id === ml.loadId);
+    if (ldObj && ldObj.kind === 'nodal') {
+      const parentNode = nodeMap.get(ldObj.nodeId);
+      if (parentNode && !targets.some((t) => t.kind === 'node' && t.nodeId === parentNode.id)) {
+        const nSc = worldToScreen(parentNode, vp);
+        targets.push({
+          kind: 'node',
+          nodeId: parentNode.id,
+          screenX: nSc.sx,
+          screenY: nSc.sy,
+        });
+        for (const sib of model.loads) {
+          if (sib.kind === 'nodal' && sib.nodeId === parentNode.id) {
+            addedLoadIds.add(sib.id);
+            targets.push({
+              kind: 'load',
+              loadId: sib.id,
+              screenX: nSc.sx,
+              screenY: nSc.sy,
+            });
+          }
+        }
+        for (const el of model.elements) {
+          if (el.kind === 'frame2d' && (el.nodeI === parentNode.id || el.nodeJ === parentNode.id)) {
+            addedMemberIds.add(el.id);
+            targets.push({
+              kind: 'member',
+              elementId: el.id,
+              screenX: nSc.sx,
+              screenY: nSc.sy,
+            });
+          }
+        }
+        continue;
+      }
+    }
+    targets.push({
       kind: 'load',
-      loadId: bestLoad.loadId,
-      screenX: bestLoad.sx,
-      screenY: bestLoad.sy,
-    };
+      loadId: ml.loadId,
+      screenX: ml.sx,
+      screenY: ml.sy,
+    });
   }
 
-  // 2. Check Nodes (within 14px)
-  let bestNode                        = null;
-  let bestNodeDist = 14;
-  let bestNodeScreen = { sx: 0, sy: 0 };
-  for (const n of model.nodes) {
-    const sc = worldToScreen(n, vp);
-    const d = Math.hypot(sx - sc.sx, sy - sc.sy);
-    if (d <= bestNodeDist) {
-      bestNodeDist = d;
-      bestNode = n;
-      bestNodeScreen = sc;
-    }
-  }
-  if (bestNode) {
-    return {
-      kind: 'node',
-      nodeId: bestNode.id,
-      screenX: bestNodeScreen.sx,
-      screenY: bestNodeScreen.sy,
-    };
-  }
-
-  // 3. Check Members (within 10px of segment)
-  let bestEl                        = null;
-  let bestElDist = 10;
-  let bestElProj = { sx: 0, sy: 0 };
+  // 3. Check Member segments (within 12 px)
   for (const el of model.elements) {
-    if (el.kind !== 'frame2d') continue;
+    if (el.kind !== 'frame2d' || addedMemberIds.has(el.id)) continue;
     const ni = nodeMap.get(el.nodeI);
     const nj = nodeMap.get(el.nodeJ);
     if (!ni || !nj) continue;
@@ -2737,24 +2912,34 @@ function hitTestCanvas(
     const px = si.sx + t * dx;
     const py = si.sy + t * dy;
     const d = Math.hypot(sx - px, sy - py);
-    if (d <= bestElDist) {
-      bestElDist = d;
-      bestEl = el;
-      bestElProj = { sx: px, sy: py };
+    if (d <= 12) {
+      addedMemberIds.add(el.id);
+      targets.push({
+        kind: 'member',
+        elementId: el.id,
+        screenX: px,
+        screenY: py,
+      });
     }
   }
 
-  if (bestEl) {
-    return {
-      kind: 'member',
-      elementId: bestEl.id,
-      screenX: bestElProj.sx,
-      screenY: bestElProj.sy,
-    };
-  }
-
-  return null;
+  return targets;
 }
+
+/**
+ * Hit-test the canvas for a single primary target.
+ */
+function hitTestCanvas(
+  sx        ,
+  sy        ,
+  vp                   ,
+  model                 ,
+  loadHandles                                                   
+)                         {
+  const all = hitTestAllCanvasEntities(sx, sy, vp, model, loadHandles);
+  return all.length > 0 ? all[0] : null;
+}
+
 
 /**
  * Interactive Hover Probe:
@@ -2832,6 +3017,8 @@ function probeMemberAtCursor(
   __exports.nextEntityId = nextEntityId;
   __exports.splitMemberAtPoint = splitMemberAtPoint;
   __exports.canAddMember = canAddMember;
+  __exports.findNodeWithinRadius = findNodeWithinRadius;
+  __exports.hitTestAllCanvasEntities = hitTestAllCanvasEntities;
   __exports.hitTestCanvas = hitTestCanvas;
   __exports.probeMemberAtCursor = probeMemberAtCursor;
   return __exports;
@@ -2918,31 +3105,32 @@ const {
  
 
 /**
- * Interpolate green -> yellow -> amber -> crimson utilization color for eta = sigma_max / fy
+ * Interpolate emerald (#059669) -> amber (#d97706) -> crimson (#dc2626) utilization color
+ * tuned for high contrast on a pure white (#ffffff) background.
  */
 function utilizationToColor(eta        , alpha = 1)         {
   const t = Math.max(0, Math.min(1.25, eta));
-  let r = 16;
-  let g = 185;
-  let b = 129;
+  let r = 5;
+  let g = 150;
+  let b = 105;
 
   if (t <= 0.5) {
-    // Emerald (#10b981) -> Amber/Yellow (#eab308)
+    // Emerald (#059669) -> Amber (#d97706)
     const u = t / 0.5;
-    r = Math.round(16 + u * (234 - 16));
-    g = Math.round(185 + u * (179 - 185));
-    b = Math.round(129 + u * (8 - 129));
+    r = Math.round(5 + u * (217 - 5));
+    g = Math.round(150 + u * (119 - 150));
+    b = Math.round(105 + u * (6 - 105));
   } else if (t <= 1.0) {
-    // Yellow (#eab308) -> Orange-Red (#f97316 -> #ef4444)
+    // Amber (#d97706) -> Crimson (#dc2626)
     const u = (t - 0.5) / 0.5;
-    r = Math.round(234 + u * (239 - 234));
-    g = Math.round(179 + u * (68 - 179));
-    b = Math.round(8 + u * (68 - 8));
+    r = Math.round(217 + u * (220 - 217));
+    g = Math.round(119 + u * (38 - 119));
+    b = Math.round(6 + u * (38 - 6));
   } else {
-    // Overstressed (> 1.0): bright crimson (#dc2626)
-    r = 220;
-    g = 38;
-    b = 38;
+    // Overstressed (> 1.0): deep crimson (#b91c1c)
+    r = 185;
+    g = 28;
+    b = 28;
   }
 
   return alpha < 1 ? `rgba(${r}, ${g}, ${b}, ${alpha})` : `rgb(${r}, ${g}, ${b})`;
@@ -2976,9 +3164,9 @@ function drawRoundedBadge(
   text        ,
   cx        ,
   cy        ,
-  bgColor        ,
-  borderColor        ,
-  textColor        ,
+  bgColor         = 'rgba(255, 255, 255, 0.92)',
+  borderColor         = '#cbd5e1',
+  textColor         = '#0f172a',
   font = '600 11px "JetBrains Mono", ui-monospace, monospace'
 )       {
   ctx.save();
@@ -2993,7 +3181,7 @@ function drawRoundedBadge(
 
   ctx.fillStyle = bgColor;
   ctx.strokeStyle = borderColor;
-  ctx.lineWidth = 1;
+  ctx.lineWidth = 1.2;
 
   ctx.beginPath();
   ctx.roundRect(x, y, w, h, r);
@@ -3122,7 +3310,7 @@ class CanvasRenderer {
     ctx.scale(dpr, dpr);
     this.render(ctx, vp, model, solverResults, snapshotLayers, neutralInteraction);
 
-    // Draw clean report caption stamp in top-left corner
+    // Draw clean report caption stamp in top-left corner on white pill background
     const modeLabelMap                                      = {
       geometry: 'Structural Geometry & Applied Loading',
       deformed: `Deformed Shape (${snapshotLayers.deflectionScale}× Exaggeration) · Max |δ| = ${solverResults.globalMaxDeflectionMm.toFixed(2)} mm`,
@@ -3139,9 +3327,9 @@ class CanvasRenderer {
       `${model.name} · ${modeLabelMap[overlayMode]}`,
       Math.min(cssWidth * 0.5, 290),
       24,
-      'rgba(15, 23, 42, 0.92)',
-      '#38bdf8',
-      '#f8fafc',
+      'rgba(255, 255, 255, 0.94)',
+      '#2563eb',
+      '#0f172a',
       '600 11px "JetBrains Mono", ui-monospace, monospace'
     );
     ctx.restore();
@@ -3167,8 +3355,8 @@ class CanvasRenderer {
     const loadHandles                     = [];
 
     ctx.save();
-    // Clear canvas with deep engineering slate background
-    ctx.fillStyle = '#0b101b';
+    // Clear canvas with pure white (#ffffff) engineering drafting background
+    ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, width, height);
 
     const nodeMap = new Map                        ();
@@ -3234,9 +3422,9 @@ class CanvasRenderer {
     const minY = Math.floor(Math.min(topLeft.y, botRight.y) - 1);
     const maxY = Math.ceil(Math.max(topLeft.y, botRight.y) + 1);
 
-    // Minor 0.1 m grid lines (visible when zoom >= 42 px/m so spacing >= 4.2px)
-    if (vp.zoom >= 42) {
-      ctx.strokeStyle = vp.zoom >= 80 ? 'rgba(148, 163, 184, 0.08)' : 'rgba(148, 163, 184, 0.045)';
+    // Minor 0.1 m grid lines in crisp light-drafting gray (#f1f5f9)
+    if (vp.zoom >= 36) {
+      ctx.strokeStyle = '#f1f5f9';
       ctx.lineWidth = 1;
       ctx.beginPath();
 
@@ -3262,8 +3450,8 @@ class CanvasRenderer {
       ctx.stroke();
     }
 
-    // Major 1.0 m grid lines
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.14)';
+    // Major 1.0 m grid lines in #cbd5e1
+    ctx.strokeStyle = '#cbd5e1';
     ctx.lineWidth = 1;
     ctx.beginPath();
 
@@ -3287,7 +3475,7 @@ class CanvasRenderer {
     if (vp.coordSystem === 'polar') {
       const origScreen = worldToScreen(vp.polarOrigin, vp);
       ctx.save();
-      ctx.strokeStyle = 'rgba(56, 189, 248, 0.18)';
+      ctx.strokeStyle = 'rgba(37, 99, 235, 0.22)';
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
       const maxR = Math.ceil(Math.hypot(maxX - minX, maxY - minY));
@@ -3309,9 +3497,9 @@ class CanvasRenderer {
       ctx.restore();
     }
 
-    // World Coordinate Axes X = 0 and Y = 0
+    // World Coordinate Axes X = 0 and Y = 0 in #64748b
     const origin = worldToScreen({ x: 0, y: 0 }, vp);
-    ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
+    ctx.strokeStyle = '#64748b';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     if (origin.sx >= 0 && origin.sx <= vp.width) {
@@ -3324,18 +3512,22 @@ class CanvasRenderer {
     }
     ctx.stroke();
 
-    // Meter coordinate tick labels along major grid lines
-    ctx.fillStyle = 'rgba(148, 163, 184, 0.48)';
+    // Meter coordinate tick labels along major grid lines in dark #334155 with subtle white halo
     ctx.font = '500 10px "JetBrains Mono", ui-monospace, monospace';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.fillStyle = '#334155';
     const labelStep = vp.zoom < 38 ? 2 : 1;
 
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
-    const axisY = Math.min(vp.height - 18, Math.max(8, origin.sy + 5));
+    const axisY = Math.min(vp.height - 20, Math.max(8, origin.sy + 5));
     for (let x = minX; x <= maxX; x += labelStep) {
       const sx = vp.panX + x * vp.zoom;
       if (sx > 30 && sx < vp.width - 30) {
-        ctx.fillText(`${x}m`, sx, axisY);
+        const txt = `${x}m`;
+        ctx.strokeText(txt, sx, axisY);
+        ctx.fillText(txt, sx, axisY);
       }
     }
 
@@ -3346,7 +3538,9 @@ class CanvasRenderer {
       if (y === 0) continue;
       const sy = vp.panY - y * vp.zoom;
       if (sy > 24 && sy < vp.height - 24) {
-        ctx.fillText(`${y}m`, axisX, sy);
+        const txt = `${y}m`;
+        ctx.strokeText(txt, axisX, sy);
+        ctx.fillText(txt, axisX, sy);
       }
     }
   }
@@ -3370,18 +3564,17 @@ class CanvasRenderer {
       const sj = worldToScreen(nj, vp);
 
       // Proportional stroke width based on cross-section depth (depthMm in mm)
-      // e.g. 120mm -> ~3.5px, 350mm -> ~6.5px, 500mm -> ~8.5px
       const depthMm = el.section.depthMm ?? 300;
-      const baseThickness = Math.min(12, Math.max(3, 2.2 + (depthMm / 1000) * 12));
+      const baseThickness = Math.min(12, Math.max(3.2, 2.4 + (depthMm / 1000) * 12));
 
       const isSelected = interaction.selectedElementId === el.id;
       const isHovered = interaction.hoveredElementId === el.id;
 
-      // Selection / hover outer glow
+      // Selection / hover outer halo
       if (isSelected || isHovered) {
         ctx.save();
-        ctx.strokeStyle = isSelected ? 'rgba(56, 189, 248, 0.45)' : 'rgba(148, 163, 184, 0.28)';
-        ctx.lineWidth = baseThickness + 7;
+        ctx.strokeStyle = isSelected ? 'rgba(37, 99, 235, 0.25)' : 'rgba(100, 116, 139, 0.22)';
+        ctx.lineWidth = baseThickness + 8;
         ctx.lineCap = 'round';
         ctx.beginPath();
         ctx.moveTo(si.sx, si.sy);
@@ -3413,14 +3606,12 @@ class CanvasRenderer {
         }
         ctx.restore();
       } else {
-        // Render material-tinted structural member with architectural depth
-        let strokeColor = '#60a5fa'; // Steel blue
-        if (el.material.preset === 'concrete') strokeColor = '#94a3b8'; // Concrete slate
-        if (el.material.preset === 'timber') strokeColor = '#f59e0b'; // Timber amber
-        if (el.material.preset === 'custom') strokeColor = '#38bdf8';
-        if (isSelected) strokeColor = '#38bdf8';
+        // Undeformed members in dark slate (#1e293b); selected members in vivid royal blue (#2563eb)
+        let strokeColor = '#1e293b';
+        if (el.material.preset === 'concrete') strokeColor = '#475569';
+        if (el.material.preset === 'timber') strokeColor = '#b45309';
+        if (isSelected) strokeColor = '#2563eb';
 
-        // Outer flange edge
         ctx.save();
         ctx.strokeStyle = strokeColor;
         ctx.lineWidth = baseThickness;
@@ -3431,9 +3622,9 @@ class CanvasRenderer {
         ctx.stroke();
 
         // Subtle inner web highlight for depth
-        if (baseThickness >= 5) {
-          ctx.strokeStyle = 'rgba(15, 23, 42, 0.5)';
-          ctx.lineWidth = Math.max(1.5, baseThickness - 3.2);
+        if (baseThickness >= 5.5) {
+          ctx.strokeStyle = isSelected ? 'rgba(219, 234, 254, 0.45)' : 'rgba(241, 245, 249, 0.35)';
+          ctx.lineWidth = Math.max(1.2, baseThickness - 3.6);
           ctx.beginPath();
           ctx.moveTo(si.sx, si.sy);
           ctx.lineTo(sj.sx, sj.sy);
@@ -3442,7 +3633,7 @@ class CanvasRenderer {
         ctx.restore();
       }
 
-      // Render member end hinges (open circles offset 12px inward from member start/end)
+      // Render member end hinges (open circles with white fill offset 12px inward from member start/end)
       const dx = sj.sx - si.sx;
       const dy = sj.sy - si.sy;
       const screenLen = Math.hypot(dx, dy);
@@ -3450,15 +3641,15 @@ class CanvasRenderer {
         const ux = dx / screenLen;
         const uy = dy / screenLen;
         const hingeOffset = 12;
-        const hingeRadius = 4.6;
+        const hingeRadius = 4.8;
 
         if (el.releaseStart) {
           const hx = si.sx + ux * hingeOffset;
           const hy = si.sy + uy * hingeOffset;
           ctx.save();
-          ctx.fillStyle = '#0b101b';
-          ctx.strokeStyle = '#fbbf24';
-          ctx.lineWidth = 2;
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = '#d97706';
+          ctx.lineWidth = 2.2;
           ctx.beginPath();
           ctx.arc(hx, hy, hingeRadius, 0, Math.PI * 2);
           ctx.fill();
@@ -3470,9 +3661,9 @@ class CanvasRenderer {
           const hx = sj.sx - ux * hingeOffset;
           const hy = sj.sy - uy * hingeOffset;
           ctx.save();
-          ctx.fillStyle = '#0b101b';
-          ctx.strokeStyle = '#fbbf24';
-          ctx.lineWidth = 2;
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = '#d97706';
+          ctx.lineWidth = 2.2;
           ctx.beginPath();
           ctx.arc(hx, hy, hingeRadius, 0, Math.PI * 2);
           ctx.fill();
@@ -3490,14 +3681,15 @@ class CanvasRenderer {
 
         if (layers.showHeatmap && solverOutput.stable && elRes) {
           const pct = (elRes.maxUtilization * 100).toFixed(0);
+          const uCol = utilizationToColor(elRes.maxUtilization);
           drawRoundedBadge(
             ctx,
             `${el.id}: ${pct}% (${elRes.maxSigmaMpa.toFixed(1)} MPa)`,
             midX + nx * 16,
             midY + ny * 16,
-            'rgba(15, 23, 42, 0.88)',
-            utilizationToColor(elRes.maxUtilization),
-            '#f8fafc',
+            'rgba(255, 255, 255, 0.92)',
+            uCol,
+            uCol,
             '600 10px "JetBrains Mono", ui-monospace, monospace'
           );
         } else if (isSelected) {
@@ -3506,9 +3698,9 @@ class CanvasRenderer {
             `${el.id} · ${el.section.name}`,
             midX + nx * 16,
             midY + ny * 16,
-            'rgba(15, 23, 42, 0.9)',
-            '#38bdf8',
-            '#e0f2fe',
+            'rgba(255, 255, 255, 0.94)',
+            '#2563eb',
+            '#1d4ed8',
             '600 10px "JetBrains Mono", ui-monospace, monospace'
           );
         }
@@ -3524,15 +3716,11 @@ class CanvasRenderer {
     for (const node of model.nodes) {
       const sc = worldToScreen(node, vp);
 
-      // 1. Render Nodal Restraint Support Symbols
+      // 1. Render Nodal Restraint Support Symbols in deep teal/slate (#0f766e / #334155)
       if (node.support !== 'none') {
         ctx.save();
         ctx.translate(sc.sx, sc.sy);
 
-        // Determine rotation angle of support base:
-        // rollerX / pinned / fixed: horizontal ground below node (0 rad)
-        // rollerY: vertical wall to the left of node (-90 deg in screen)
-        // inclinedRoller: rotated by -inclinedAngleDeg (since screen +Y is down and world +Y is up)
         let rotRad = 0;
         if (node.support === 'rollerY') {
           rotRad = -Math.PI / 2;
@@ -3541,9 +3729,9 @@ class CanvasRenderer {
         }
         ctx.rotate(rotRad);
 
-        ctx.strokeStyle = '#2dd4bf'; // Teal engineering support symbol
-        ctx.fillStyle = 'rgba(45, 212, 191, 0.16)';
-        ctx.lineWidth = 1.8;
+        ctx.strokeStyle = '#0f766e'; // Deep teal support symbol
+        ctx.fillStyle = 'rgba(15, 118, 110, 0.14)';
+        ctx.lineWidth = 1.9;
 
         if (node.support === 'fixed') {
           // Fixed support block & hatches
@@ -3552,12 +3740,13 @@ class CanvasRenderer {
           ctx.lineTo(14, 4);
           ctx.stroke();
 
-          ctx.fillStyle = 'rgba(45, 212, 191, 0.22)';
+          ctx.fillStyle = 'rgba(15, 118, 110, 0.18)';
           ctx.fillRect(-10, -4, 20, 8);
           ctx.strokeRect(-10, -4, 20, 8);
 
-          // Ground hatches
-          ctx.lineWidth = 1.3;
+          // Ground hatches in slate #334155
+          ctx.strokeStyle = '#334155';
+          ctx.lineWidth = 1.4;
           for (let hx = -12; hx <= 12; hx += 6) {
             ctx.beginPath();
             ctx.moveTo(hx, 4);
@@ -3575,11 +3764,12 @@ class CanvasRenderer {
           ctx.stroke();
 
           // Ground line & hatches
+          ctx.strokeStyle = '#334155';
           ctx.beginPath();
           ctx.moveTo(-15, 17);
           ctx.lineTo(15, 17);
           ctx.stroke();
-          ctx.lineWidth = 1.2;
+          ctx.lineWidth = 1.3;
           for (let hx = -12; hx <= 12; hx += 6) {
             ctx.beginPath();
             ctx.moveTo(hx, 17);
@@ -3606,15 +3796,16 @@ class CanvasRenderer {
           ctx.arc(5, 17.5, 2.8, 0, Math.PI * 2);
           ctx.stroke();
 
-          // Ground line
+          // Ground line in #334155
+          ctx.strokeStyle = '#334155';
           ctx.beginPath();
           ctx.moveTo(-14, 21);
           ctx.lineTo(14, 21);
           ctx.stroke();
 
           if (node.support === 'inclinedRoller') {
-            ctx.fillStyle = '#5eead4';
-            ctx.font = '600 9px "JetBrains Mono", ui-monospace, monospace';
+            ctx.fillStyle = '#0f766e';
+            ctx.font = '600 9.5px "JetBrains Mono", ui-monospace, monospace';
             ctx.textAlign = 'center';
             ctx.fillText(`α=${node.inclinedAngleDeg ?? 0}°`, 0, 31);
           }
@@ -3623,14 +3814,13 @@ class CanvasRenderer {
         ctx.restore();
       }
 
-      // 2. Render Elastic Springs (kx, ky, krz)
+      // 2. Render Elastic Springs (kx, ky, krz) in rich purple (#7c3aed)
       const { kx, ky, krz } = node.springs;
 
       if (ky > 0) {
-        // Vertical spring coil below node
         ctx.save();
-        ctx.strokeStyle = '#a78bfa';
-        ctx.lineWidth = 1.7;
+        ctx.strokeStyle = '#7c3aed';
+        ctx.lineWidth = 1.8;
         const startY = sc.sy + (node.support !== 'none' ? 22 : 4);
         ctx.beginPath();
         ctx.moveTo(sc.sx, startY);
@@ -3652,10 +3842,9 @@ class CanvasRenderer {
       }
 
       if (kx > 0) {
-        // Horizontal spring coil to the left of node
         ctx.save();
-        ctx.strokeStyle = '#a78bfa';
-        ctx.lineWidth = 1.7;
+        ctx.strokeStyle = '#7c3aed';
+        ctx.lineWidth = 1.8;
         const startX = sc.sx - 4;
         ctx.beginPath();
         ctx.moveTo(startX, sc.sy);
@@ -3677,10 +3866,9 @@ class CanvasRenderer {
       }
 
       if (krz > 0) {
-        // Rotational spiral spring symbol around node
         ctx.save();
-        ctx.strokeStyle = '#c084fc';
-        ctx.lineWidth = 1.8;
+        ctx.strokeStyle = '#7c3aed';
+        ctx.lineWidth = 1.9;
         ctx.beginPath();
         const turns = 1.65;
         const steps = 28;
@@ -3694,10 +3882,16 @@ class CanvasRenderer {
           else ctx.lineTo(px, py);
         }
         ctx.stroke();
-        ctx.fillStyle = '#d8b4fe';
-        ctx.font = '600 9.5px "JetBrains Mono", ui-monospace, monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText(`kθ=${(krz / 1000).toFixed(1)}k`, sc.sx, sc.sy - 17);
+        drawRoundedBadge(
+          ctx,
+          `kθ=${(krz / 1000).toFixed(1)}k`,
+          sc.sx,
+          sc.sy - 20,
+          'rgba(255, 255, 255, 0.92)',
+          '#7c3aed',
+          '#6d28d9',
+          '600 9.5px "JetBrains Mono", ui-monospace, monospace'
+        );
         ctx.restore();
       }
     }
@@ -3711,7 +3905,6 @@ class CanvasRenderer {
     nodeMap                             ,
     loadHandles                    
   )       {
-    // Compute max distributed load and max point load for visual scaling
     let maxDist = 10;
     let maxPoint = 10;
 
@@ -3727,8 +3920,9 @@ class CanvasRenderer {
 
     for (const ld of model.loads) {
       const isSelected = interaction.selectedLoadId === ld.id;
-      const strokeCol = isSelected ? '#fde047' : '#fb923c';
-      const fillCol = isSelected ? 'rgba(253, 224, 71, 0.22)' : 'rgba(251, 146, 60, 0.16)';
+      const strokeCol = isSelected ? '#2563eb' : '#d97706';
+      const fillCol = isSelected ? 'rgba(37, 99, 235, 0.14)' : 'rgba(217, 119, 6, 0.14)';
+      const textCol = isSelected ? '#1d4ed8' : '#b45309';
 
       if (ld.kind === 'member_distributed') {
         const el = model.elements.find(
@@ -3742,13 +3936,11 @@ class CanvasRenderer {
         const si = worldToScreen(ni, vp);
         const sj = worldToScreen(nj, vp);
 
-        // Determine unit screen vector in the direction the load pushes
         const L = Math.hypot(nj.x - ni.x, nj.y - ni.y);
         if (L < 1e-6) continue;
         const cos = (nj.x - ni.x) / L;
         const sin = (nj.y - ni.y) / L;
 
-        // World force unit direction for a +1 load value:
         let fDirWorldX = 0;
         let fDirWorldY = 0;
         if (ld.direction === 'global_x') {
@@ -3758,17 +3950,14 @@ class CanvasRenderer {
           fDirWorldX = 0;
           fDirWorldY = 1;
         } else {
-          // local_perp (+y local = (-sin, cos))
           fDirWorldX = -sin;
           fDirWorldY = cos;
         }
 
-        // Screen force direction (note screen Y is inverted from world Y)
         const fDirScreenX = fDirWorldX;
         const fDirScreenY = -fDirWorldY;
 
         const maxEnvPx = 46;
-        // Offset tail away from member in opposite direction of force so arrows point ONTO the member
         const h1 = (ld.w1 / maxDist) * maxEnvPx;
         const h2 = (ld.w2 / maxDist) * maxEnvPx;
 
@@ -3780,9 +3969,8 @@ class CanvasRenderer {
         ctx.save();
         ctx.fillStyle = fillCol;
         ctx.strokeStyle = strokeCol;
-        ctx.lineWidth = isSelected ? 2.2 : 1.5;
+        ctx.lineWidth = isSelected ? 2.2 : 1.6;
 
-        // Shaded trapezoidal load envelope polygon
         ctx.beginPath();
         ctx.moveTo(si.sx, si.sy);
         ctx.lineTo(tail1X, tail1Y);
@@ -3792,7 +3980,6 @@ class CanvasRenderer {
         ctx.fill();
         ctx.stroke();
 
-        // Draw comb arrows along the member
         const screenSpan = Math.hypot(sj.sx - si.sx, sj.sy - si.sy);
         const numArrows = Math.max(3, Math.min(12, Math.floor(screenSpan / 28)));
         ctx.fillStyle = strokeCol;
@@ -3814,7 +4001,6 @@ class CanvasRenderer {
           drawArrowhead(ctx, bx, by, bx - tx, by - ty, Math.min(7, arrowLen * 0.6));
         }
 
-        // Interactive click handle & label at midpoint of envelope top edge
         const handleX = 0.5 * (tail1X + tail2X);
         const handleY = 0.5 * (tail1Y + tail2Y);
         loadHandles.push({ loadId: ld.id, sx: handleX, sy: handleY });
@@ -3829,9 +4015,9 @@ class CanvasRenderer {
           labelText,
           handleX,
           handleY,
-          isSelected ? 'rgba(15, 23, 42, 0.96)' : 'rgba(15, 23, 42, 0.85)',
+          'rgba(255, 255, 255, 0.92)',
           strokeCol,
-          isSelected ? '#fde047' : '#fdba74',
+          textCol,
           '600 10px "JetBrains Mono", ui-monospace, monospace'
         );
 
@@ -3890,9 +4076,9 @@ class CanvasRenderer {
           `${Math.abs(ld.p).toFixed(1)} kN`,
           tailX - dirSx * 10,
           tailY - dirSy * 10,
-          'rgba(15, 23, 42, 0.9)',
+          'rgba(255, 255, 255, 0.92)',
           strokeCol,
-          isSelected ? '#fde047' : '#fdba74',
+          textCol,
           '600 10.5px "JetBrains Mono", ui-monospace, monospace'
         );
         ctx.restore();
@@ -3925,9 +4111,9 @@ class CanvasRenderer {
             `${fMag.toFixed(1)} kN`,
             tailX - dirSx * 11,
             tailY - dirSy * 11,
-            'rgba(15, 23, 42, 0.9)',
+            'rgba(255, 255, 255, 0.92)',
             strokeCol,
-            isSelected ? '#fde047' : '#fdba74',
+            textCol,
             '600 10.5px "JetBrains Mono", ui-monospace, monospace'
           );
           ctx.restore();
@@ -3948,9 +4134,9 @@ class CanvasRenderer {
             `${ld.mz.toFixed(1)} kNm`,
             tip.sx,
             tip.sy - r - 10,
-            'rgba(15, 23, 42, 0.9)',
+            'rgba(255, 255, 255, 0.92)',
             strokeCol,
-            isSelected ? '#fde047' : '#fdba74'
+            textCol
           );
           ctx.restore();
         }
@@ -3966,8 +4152,8 @@ class CanvasRenderer {
     layers                    
   )       {
     ctx.save();
-    ctx.strokeStyle = '#38bdf8';
-    ctx.lineWidth = 2.4;
+    ctx.strokeStyle = '#2563eb';
+    ctx.lineWidth = 2.5;
 
     // Convert mm deflection * exaggeration scale to world meters (* 1e-3)
     const scaleMPerMm = layers.deflectionScale * 1e-3;
@@ -3998,9 +4184,9 @@ class CanvasRenderer {
           },
           vp
         );
-        ctx.fillStyle = '#0284c7';
+        ctx.fillStyle = '#1d4ed8';
         ctx.beginPath();
-        ctx.arc(sc.sx, sc.sy, 3.2, 0, Math.PI * 2);
+        ctx.arc(sc.sx, sc.sy, 3.3, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -4030,28 +4216,27 @@ class CanvasRenderer {
       const elRes = solverOutput.elementResults[el.id];
       if (!elRes || elRes.stations.length < 2) continue;
 
-      // Local +y normal in world is (-sin, cos), so in screen pixels:
-      // screenNormalX = -sin, screenNormalY = -cos
       const nSx = -elRes.sin;
       const nSy = -elRes.cos;
 
       const getVal = (st                                 )         => {
         if (diagramType === 'N') return st.N;
         if (diagramType === 'V') return st.V;
-        // For Moment M:
-        // Positive M is sagging (bottom fiber -y in tension, top fiber +y in compression).
-        // When momentSide === 'tension', plot positive M toward bottom fiber (-y local => -nSx, -nSy).
         return layers.momentSide === 'tension' ? -st.M : st.M;
       };
 
+      // High-contrast colors tuned for white background:
+      // N: #7c3aed (purple), V: #059669 (emerald), M: #dc2626 (red)
       const strokeCol =
-        diagramType === 'N' ? '#a855f7' : diagramType === 'V' ? '#10b981' : '#f43f5e';
+        diagramType === 'N' ? '#7c3aed' : diagramType === 'V' ? '#059669' : '#dc2626';
       const fillCol =
         diagramType === 'N'
-          ? 'rgba(168, 85, 247, 0.18)'
+          ? 'rgba(124, 58, 237, 0.14)'
           : diagramType === 'V'
-            ? 'rgba(16, 185, 129, 0.18)'
-            : 'rgba(244, 63, 94, 0.20)';
+            ? 'rgba(5, 150, 105, 0.14)'
+            : 'rgba(220, 38, 38, 0.15)';
+      const textCol =
+        diagramType === 'N' ? '#6d28d9' : diagramType === 'V' ? '#047857' : '#b91c1c';
 
       ctx.save();
       ctx.fillStyle = fillCol;
@@ -4103,7 +4288,7 @@ class CanvasRenderer {
       ctx.lineTo(endBase.sx, endBase.sy);
       ctx.stroke();
 
-      // Peak value callout on element if significant
+      // Peak value callout on white pill background so numbers never clash with grid lines
       if (Math.abs(peakVal) > 0.05) {
         const unit = diagramType === 'M' ? 'kNm' : 'kN';
         const prefix =
@@ -4113,9 +4298,9 @@ class CanvasRenderer {
           `${prefix}${Math.abs(peakVal).toFixed(1)} ${unit}`,
           peakPos.sx,
           peakPos.sy,
-          'rgba(15, 23, 42, 0.88)',
+          'rgba(255, 255, 255, 0.92)',
           strokeCol,
-          '#f8fafc',
+          textCol,
           '600 9.5px "JetBrains Mono", ui-monospace, monospace'
         );
       }
@@ -4136,8 +4321,8 @@ class CanvasRenderer {
       const sc = worldToScreen(node, vp);
 
       ctx.save();
-      ctx.strokeStyle = '#34d399';
-      ctx.fillStyle = '#34d399';
+      ctx.strokeStyle = '#059669';
+      ctx.fillStyle = '#059669';
       ctx.lineWidth = 2.2;
 
       if (Math.abs(nr.reactionFy) > 0.05) {
@@ -4157,9 +4342,9 @@ class CanvasRenderer {
           `Ry=${nr.reactionFy.toFixed(1)} kN`,
           sc.sx,
           Math.max(tipY, tailY) + 12,
-          'rgba(6, 78, 59, 0.92)',
-          '#34d399',
-          '#ecfdf5',
+          'rgba(255, 255, 255, 0.92)',
+          '#059669',
+          '#047857',
           '600 9.5px "JetBrains Mono", ui-monospace, monospace'
         );
       }
@@ -4180,9 +4365,9 @@ class CanvasRenderer {
           `Rx=${nr.reactionFx.toFixed(1)} kN`,
           tailX - dirSx * 28,
           sc.sy - 12,
-          'rgba(6, 78, 59, 0.92)',
-          '#34d399',
-          '#ecfdf5',
+          'rgba(255, 255, 255, 0.92)',
+          '#059669',
+          '#047857',
           '600 9.5px "JetBrains Mono", ui-monospace, monospace'
         );
       }
@@ -4193,9 +4378,9 @@ class CanvasRenderer {
           `Mz=${nr.reactionMz.toFixed(1)} kNm`,
           sc.sx + 44,
           sc.sy + 20,
-          'rgba(6, 78, 59, 0.92)',
-          '#34d399',
-          '#ecfdf5',
+          'rgba(255, 255, 255, 0.92)',
+          '#059669',
+          '#047857',
           '600 9.5px "JetBrains Mono", ui-monospace, monospace'
         );
       }
@@ -4216,25 +4401,28 @@ class CanvasRenderer {
 
       ctx.save();
       if (isSelected) {
-        ctx.fillStyle = 'rgba(56, 189, 248, 0.28)';
+        ctx.fillStyle = 'rgba(37, 99, 235, 0.22)';
         ctx.beginPath();
         ctx.arc(sc.sx, sc.sy, 11, 0, Math.PI * 2);
         ctx.fill();
       }
 
-      ctx.fillStyle = isSelected ? '#38bdf8' : '#f8fafc';
-      ctx.strokeStyle = '#0f172a';
-      ctx.lineWidth = 2;
+      ctx.fillStyle = isSelected ? '#2563eb' : '#ffffff';
+      ctx.strokeStyle = isSelected ? '#1d4ed8' : '#1e293b';
+      ctx.lineWidth = 2.2;
       ctx.beginPath();
       ctx.arc(sc.sx, sc.sy, isSelected ? 6 : 4.8, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
 
-      // Node ID tag
-      ctx.fillStyle = isSelected ? '#38bdf8' : 'rgba(226, 232, 240, 0.78)';
+      // Node ID tag with white halo so it never clashes with grid lines
       ctx.font = '600 10.5px "JetBrains Mono", ui-monospace, monospace';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'bottom';
+      ctx.lineWidth = 3.2;
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+      ctx.strokeText(node.id, sc.sx + 7, sc.sy - 5);
+      ctx.fillStyle = isSelected ? '#2563eb' : '#0f172a';
       ctx.fillText(node.id, sc.sx + 7, sc.sy - 5);
       ctx.restore();
     }
@@ -4256,7 +4444,7 @@ class CanvasRenderer {
       const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
 
       ctx.save();
-      ctx.strokeStyle = '#38bdf8';
+      ctx.strokeStyle = '#2563eb';
       ctx.lineWidth = 2.5;
       ctx.setLineDash([6, 4]);
       ctx.beginPath();
@@ -4265,6 +4453,12 @@ class CanvasRenderer {
       ctx.stroke();
       ctx.setLineDash([]);
 
+      // Highlight start point dot
+      ctx.fillStyle = '#2563eb';
+      ctx.beginPath();
+      ctx.arc(sStart.sx, sStart.sy, 5, 0, Math.PI * 2);
+      ctx.fill();
+
       const midX = (sStart.sx + snapTarget.sx) * 0.5;
       const midY = (sStart.sy + snapTarget.sy) * 0.5 - 18;
       drawRoundedBadge(
@@ -4272,9 +4466,9 @@ class CanvasRenderer {
         `L = ${lenM.toFixed(2)} m · ∠ ${angleDeg.toFixed(1)}°`,
         midX,
         midY,
-        'rgba(2, 132, 199, 0.95)',
-        '#7dd3fc',
-        '#ffffff',
+        'rgba(255, 255, 255, 0.95)',
+        '#2563eb',
+        '#1d4ed8',
         '600 11px "JetBrains Mono", ui-monospace, monospace'
       );
       ctx.restore();
@@ -4284,15 +4478,17 @@ class CanvasRenderer {
     if (snapTarget && activeTool !== 'select') {
       ctx.save();
       if (snapTarget.kind === 'node') {
-        ctx.strokeStyle = '#22d3ee';
+        ctx.strokeStyle = '#0f766e';
+        ctx.fillStyle = 'rgba(15, 118, 110, 0.14)';
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(snapTarget.sx, snapTarget.sy, 10, 0, Math.PI * 2);
+        ctx.fill();
         ctx.stroke();
       } else if (snapTarget.kind === 'member_segment') {
         // Diamond T-junction split indicator
-        ctx.strokeStyle = '#f59e0b';
-        ctx.fillStyle = 'rgba(245, 158, 11, 0.25)';
+        ctx.strokeStyle = '#d97706';
+        ctx.fillStyle = 'rgba(217, 119, 6, 0.2)';
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(snapTarget.sx, snapTarget.sy - 8);
@@ -4308,15 +4504,15 @@ class CanvasRenderer {
           `T-Split ${snapTarget.splitElementId} (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
           snapTarget.sx,
           snapTarget.sy - 20,
-          'rgba(120, 53, 15, 0.92)',
-          '#f59e0b',
-          '#fef3c7',
+          'rgba(255, 255, 255, 0.94)',
+          '#d97706',
+          '#b45309',
           '600 10px "JetBrains Mono", ui-monospace, monospace'
         );
       } else {
         // 0.1m Grid snap crosshair
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.75)';
-        ctx.lineWidth = 1.4;
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.moveTo(snapTarget.sx - 6, snapTarget.sy);
         ctx.lineTo(snapTarget.sx + 6, snapTarget.sy);
@@ -4331,9 +4527,9 @@ class CanvasRenderer {
             `r=${pol.r.toFixed(2)}m, θ=${pol.thetaDeg.toFixed(1)}°`,
             snapTarget.sx + 58,
             snapTarget.sy + 18,
-            'rgba(15, 23, 42, 0.85)',
-            '#38bdf8',
-            '#bae6fd',
+            'rgba(255, 255, 255, 0.92)',
+            '#2563eb',
+            '#1d4ed8',
             '500 10px "JetBrains Mono", ui-monospace, monospace'
           );
         }
@@ -4344,9 +4540,9 @@ class CanvasRenderer {
     // 3. Hover Probe glowing marker on member
     if (hoverProbe) {
       ctx.save();
-      ctx.fillStyle = '#38bdf8';
+      ctx.fillStyle = '#2563eb';
       ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 2.2;
       ctx.beginPath();
       ctx.arc(hoverProbe.screenX, hoverProbe.screenY, 5.5, 0, Math.PI * 2);
       ctx.fill();
@@ -4355,6 +4551,7 @@ class CanvasRenderer {
     }
   }
 }
+
 
 
 
@@ -5122,6 +5319,29 @@ const Gauge = createLucideIcon([
   { tag: 'path', attrs: { d: 'M3.34 19a10 10 0 1 1 17.32 0' } },
 ]);
 
+const FilePlus = createLucideIcon([
+  { tag: 'path', attrs: { d: 'M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z' } },
+  { tag: 'polyline', attrs: { points: '14 2 14 8 20 8' } },
+  { tag: 'line', attrs: { x1: '12', y1: '18', x2: '12', y2: '12' } },
+  { tag: 'line', attrs: { x1: '9', y1: '15', x2: '15', y2: '15' } },
+]);
+
+const PlusSquare = createLucideIcon([
+  { tag: 'rect', attrs: { width: '18', height: '18', x: '3', y: '3', rx: '2' } },
+  { tag: 'line', attrs: { x1: '12', y1: '8', x2: '12', y2: '16' } },
+  { tag: 'line', attrs: { x1: '8', y1: '12', x2: '16', y2: '12' } },
+]);
+
+const FolderOpen = createLucideIcon([
+  {
+    tag: 'path',
+    attrs: {
+      d: 'm6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2',
+    },
+  },
+]);
+
+
 
 
   __exports.MousePointer = MousePointer;
@@ -5151,6 +5371,9 @@ const Gauge = createLucideIcon([
   __exports.Crosshair = Crosshair;
   __exports.Boxes = Boxes;
   __exports.Gauge = Gauge;
+  __exports.FilePlus = FilePlus;
+  __exports.PlusSquare = PlusSquare;
+  __exports.FolderOpen = FolderOpen;
   return __exports;
 })();
 
@@ -5172,6 +5395,7 @@ const {
   Redo2,
   Download,
   Upload,
+  FilePlus,
   Maximize2,
   ZoomIn,
   ZoomOut,
@@ -5192,6 +5416,7 @@ const {
                                
                          
                                              
+                           
                              
                                                
                    
@@ -5212,6 +5437,7 @@ const {
 function Toolbar({
   activePresetId,
   onSelectPreset,
+  onNewProject,
   activeTool,
   onSelectTool,
   canUndo,
@@ -5262,40 +5488,51 @@ function Toolbar({
   };
 
   return (
-    React.createElement("header", { "id": "app-top-toolbar", "className": "flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-slate-900/95 border-b border-slate-800 text-slate-100 select-none z-20" }, React.createElement("div", { "className": "flex items-center gap-3" }, React.createElement("div", { "className": "flex items-center gap-2 pr-2 border-r border-slate-800" }, React.createElement("div", { "className": "w-8 h-8 rounded-lg bg-sky-500/15 border border-sky-400/40 flex items-center justify-center text-sky-400" }, React.createElement(Boxes, { "size": 18 })), React.createElement("div", null, React.createElement("h1", { "className": "text-xs font-bold tracking-wider uppercase text-slate-100 leading-tight" }, "FEM Studio 2D"), React.createElement("p", { "className": "text-[10px] font-mono text-slate-400 leading-tight" }, "6-DOF Euler-Bernoulli · SI"))), React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement("label", { "htmlFor": "preset-benchmark-select", "className": "text-[11px] font-medium text-slate-400 hidden sm:inline" }, "Benchmark:"), React.createElement("select", { "id": "preset-benchmark-select", "value": activePresetId, "onChange": (e     ) => onSelectPreset(e.target.value), "className": "bg-slate-800/90 hover:bg-slate-800 text-slate-100 text-xs font-medium rounded-md px-2.5 py-1.5 border border-slate-700 focus:outline-none focus:border-sky-400 transition-colors cursor-pointer" }, BENCHMARK_PRESETS.map((p) => (
+    React.createElement("header", { "id": "app-top-toolbar", "className": "flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-white border-b border-slate-200 text-slate-900 shadow-xs select-none z-20" }, React.createElement("div", { "className": "flex items-center gap-2.5" }, React.createElement("div", { "className": "flex items-center gap-2 pr-2.5 border-r border-slate-200" }, React.createElement("div", { "className": "w-8 h-8 rounded-lg bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600" }, React.createElement(Boxes, { "size": 18 })), React.createElement("div", null, React.createElement("h1", { "className": "text-xs font-bold tracking-wider uppercase text-slate-900 leading-tight" }, "FEM Studio 2D"), React.createElement("p", { "className": "text-[10px] font-mono text-slate-500 leading-tight" }, "6-DOF Euler-Bernoulli · SI"))), React.createElement("button", { "id": "btn-new-project", "type": "button", "onClick": onNewProject, "title": "New Blank Project (Clears workspace to empty 0.1 m grid; Undo with Ctrl+Z)", "className": "flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold bg-slate-50 hover:bg-slate-100 text-slate-700 hover:text-slate-900 border border-slate-300 transition-colors cursor-pointer shadow-2xs" }, React.createElement(FilePlus, { "size": 14, "className": "text-blue-600" }), React.createElement("span", null, "New")), React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement("label", { "htmlFor": "preset-benchmark-select", "className": "text-[11px] font-medium text-slate-500 hidden sm:inline" }, "Preset:"), React.createElement("select", { "id": "preset-benchmark-select", "value": activePresetId, "onChange": (e     ) => {
+              if (e.target.value === 'blank') {
+                onNewProject();
+              } else {
+                onSelectPreset(e.target.value);
+              }
+            }, "className": "bg-slate-50 hover:bg-slate-100 text-slate-800 text-xs font-medium rounded-md px-2.5 py-1.5 border border-slate-300 focus:outline-none focus:border-blue-500 transition-colors cursor-pointer" }, activePresetId === 'blank' ? (
+              React.createElement("option", { "value": "blank" }, "Blank Workspace (0.1 m Grid)")
+            ) : null, BENCHMARK_PRESETS.map((p) => (
               React.createElement("option", { "key": p.id, "value": p.id }, p.title, " (", p.badge, ")")
-            ))))), React.createElement("div", { "className": "flex items-center gap-1 bg-slate-950/80 p-1 rounded-lg border border-slate-800" }, tools.map((t) => {
+            ))))), React.createElement("div", { "className": "flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200" }, tools.map((t) => {
           const IconComp = t.icon;
           const active = activeTool === t.id;
           const isDelete = t.id === 'delete';
           return (
-            React.createElement("button", { "key": t.id, "id": `tool-btn-${t.id}`, "type": "button", "onClick": () => onSelectTool(t.id), "title": `${t.label} (${t.shortcut})`, "className": `flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium transition-all cursor-pointer ${
+            React.createElement("button", { "key": t.id, "id": `tool-btn-${t.id}`, "type": "button", "onClick": () => onSelectTool(t.id), "title": `${t.label} (${t.shortcut})`, "className": `flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-semibold transition-all cursor-pointer ${
                 active
                   ? isDelete
-                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/50 shadow-sm'
-                    : 'bg-sky-500/20 text-sky-300 border border-sky-400/50 shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70 border border-transparent'
-              }` }, React.createElement(IconComp, { "size": 14 }), React.createElement("span", { "className": "hidden md:inline" }, t.label), React.createElement("span", { "className": "text-[10px] font-mono opacity-60 hidden lg:inline" }, "[", t.shortcut, "]"))
+                    ? 'bg-red-600 text-white border border-red-600 shadow-xs'
+                    : 'bg-blue-600 text-white border border-blue-600 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white border border-transparent'
+              }` }, React.createElement(IconComp, { "size": 14 }), React.createElement("span", { "className": "hidden md:inline" }, t.label), React.createElement("span", { "className": `text-[10px] font-mono hidden lg:inline ${
+                  active ? 'text-blue-100' : 'text-slate-400'
+                }` }, "[", t.shortcut, "]"))
           );
         })), React.createElement("div", { "className": "flex items-center gap-2" }, solverOutput.stable ? (
-          React.createElement("div", { "id": "solver-status-badge", "className": "flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-mono", "title": solverOutput.statusMessage }, React.createElement(CheckCircle2, { "size": 13 }), React.createElement("span", { "className": "font-semibold" }, "Stable"))
+          React.createElement("div", { "id": "solver-status-badge", "className": "flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-300 text-emerald-700 text-xs font-mono", "title": solverOutput.statusMessage }, React.createElement(CheckCircle2, { "size": 13, "className": "text-emerald-600" }), React.createElement("span", { "className": "font-semibold" }, "Stable"))
         ) : (
-          React.createElement("div", { "id": "solver-status-badge", "className": "flex items-center gap-1.5 px-3 py-1 rounded-full bg-rose-500/25 border border-rose-500 text-rose-200 text-xs font-mono animate-pulse", "title": solverOutput.instabilityReason || 'Mechanism detected' }, React.createElement(AlertTriangle, { "size": 14, "className": "text-rose-400" }), React.createElement("span", { "className": "font-bold tracking-wide uppercase" }, "Unstable Structure"))
-        ), React.createElement("div", { "className": "flex items-center bg-slate-800/70 rounded-md border border-slate-700/80 p-0.5" }, React.createElement("button", { "id": "btn-undo", "type": "button", "disabled": !canUndo, "onClick": onUndo, "title": "Undo (Ctrl+Z)", "className": `p-1.5 rounded transition-colors ${
+          React.createElement("div", { "id": "solver-status-badge", "className": "flex items-center gap-1.5 px-3 py-1 rounded-full bg-red-50 border border-red-400 text-red-700 text-xs font-mono", "title": solverOutput.instabilityReason || 'Mechanism or empty structure' }, React.createElement(AlertTriangle, { "size": 14, "className": "text-red-600" }), React.createElement("span", { "className": "font-bold tracking-wide uppercase" }, "Unstable Structure"))
+        ), React.createElement("div", { "className": "flex items-center bg-slate-100 rounded-md border border-slate-200 p-0.5" }, React.createElement("button", { "id": "btn-undo", "type": "button", "disabled": !canUndo, "onClick": onUndo, "title": "Undo (Ctrl+Z)", "className": `p-1.5 rounded transition-colors ${
               canUndo
-                ? 'text-slate-200 hover:bg-slate-700 cursor-pointer'
-                : 'text-slate-600 cursor-not-allowed'
+                ? 'text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer'
+                : 'text-slate-300 cursor-not-allowed'
             }` }, React.createElement(Undo2, { "size": 14 })), React.createElement("button", { "id": "btn-redo", "type": "button", "disabled": !canRedo, "onClick": onRedo, "title": "Redo (Ctrl+Y)", "className": `p-1.5 rounded transition-colors ${
               canRedo
-                ? 'text-slate-200 hover:bg-slate-700 cursor-pointer'
-                : 'text-slate-600 cursor-not-allowed'
-            }` }, React.createElement(Redo2, { "size": 14 }))), React.createElement("div", { "className": "flex items-center bg-slate-800/70 rounded-md border border-slate-700/80 p-0.5" }, React.createElement("button", { "id": "btn-zoom-in", "type": "button", "onClick": onZoomIn, "title": "Zoom In", "className": "p-1.5 rounded text-slate-200 hover:bg-slate-700 cursor-pointer" }, React.createElement(ZoomIn, { "size": 14 })), React.createElement("button", { "id": "btn-zoom-out", "type": "button", "onClick": onZoomOut, "title": "Zoom Out", "className": "p-1.5 rounded text-slate-200 hover:bg-slate-700 cursor-pointer" }, React.createElement(ZoomOut, { "size": 14 })), React.createElement("button", { "id": "btn-fit-view", "type": "button", "onClick": onFitView, "title": "Fit Structure to Viewport", "className": "p-1.5 rounded text-slate-200 hover:bg-slate-700 cursor-pointer" }, React.createElement(Maximize2, { "size": 14 })), React.createElement("button", { "id": "btn-coord-mode", "type": "button", "onClick": onToggleCoordSystem, "title": "Toggle Cartesian (x,y) vs Polar (r,θ) Coordinate Overlay", "className": `flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono cursor-pointer transition-colors ${
+                ? 'text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer'
+                : 'text-slate-300 cursor-not-allowed'
+            }` }, React.createElement(Redo2, { "size": 14 }))), React.createElement("div", { "className": "flex items-center bg-slate-100 rounded-md border border-slate-200 p-0.5" }, React.createElement("button", { "id": "btn-zoom-in", "type": "button", "onClick": onZoomIn, "title": "Zoom In", "className": "p-1.5 rounded text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer" }, React.createElement(ZoomIn, { "size": 14 })), React.createElement("button", { "id": "btn-zoom-out", "type": "button", "onClick": onZoomOut, "title": "Zoom Out", "className": "p-1.5 rounded text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer" }, React.createElement(ZoomOut, { "size": 14 })), React.createElement("button", { "id": "btn-fit-view", "type": "button", "onClick": onFitView, "title": "Fit Structure to Viewport", "className": "p-1.5 rounded text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer" }, React.createElement(Maximize2, { "size": 14 })), React.createElement("button", { "id": "btn-coord-mode", "type": "button", "onClick": onToggleCoordSystem, "title": "Toggle Cartesian (x,y) vs Polar (r,θ) Coordinate Overlay", "className": `flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono cursor-pointer transition-colors ${
               coordSystem === 'polar'
-                ? 'bg-sky-500/25 text-sky-300'
-                : 'text-slate-300 hover:bg-slate-700'
-            }` }, React.createElement(Compass, { "size": 13 }), React.createElement("span", null, coordSystem === 'polar' ? '(r,θ)' : '(x,y)'))), React.createElement("div", { "className": "flex items-center bg-slate-800/70 rounded-md border border-slate-700/80 p-0.5" }, React.createElement("button", { "id": "btn-export-json", "type": "button", "onClick": onExportJson, "title": "Export Model as JSON", "className": "flex items-center gap-1 px-2 py-1 rounded text-xs text-slate-200 hover:bg-slate-700 cursor-pointer" }, React.createElement(Download, { "size": 13 }), React.createElement("span", { "className": "hidden xl:inline" }, "Export")), React.createElement("button", { "id": "btn-import-json", "type": "button", "onClick": () => fileInputRef.current?.click(), "title": "Import Model from JSON", "className": "flex items-center gap-1 px-2 py-1 rounded text-xs text-slate-200 hover:bg-slate-700 cursor-pointer" }, React.createElement(Upload, { "size": 13 }), React.createElement("span", { "className": "hidden xl:inline" }, "Import")), React.createElement("input", { "ref": fileInputRef, "type": "file", "accept": ".json,application/json", "onChange": handleFileChange, "className": "hidden" }))))
+                ? 'bg-blue-600 text-white font-semibold'
+                : 'text-slate-700 hover:bg-white hover:text-slate-900'
+            }` }, React.createElement(Compass, { "size": 13 }), React.createElement("span", null, coordSystem === 'polar' ? '(r,θ)' : '(x,y)'))), React.createElement("div", { "className": "flex items-center bg-slate-100 rounded-md border border-slate-200 p-0.5" }, React.createElement("button", { "id": "btn-import-json", "type": "button", "onClick": () => fileInputRef.current?.click(), "title": "Import Model from JSON", "className": "flex items-center gap-1 px-2 py-1 rounded text-xs font-medium text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer" }, React.createElement(Upload, { "size": 13, "className": "text-blue-600" }), React.createElement("span", null, "Import")), React.createElement("button", { "id": "btn-export-json", "type": "button", "onClick": onExportJson, "title": "Export Model as JSON", "className": "flex items-center gap-1 px-2 py-1 rounded text-xs font-medium text-slate-700 hover:bg-white hover:text-slate-900 cursor-pointer" }, React.createElement(Download, { "size": 13, "className": "text-emerald-600" }), React.createElement("span", null, "Export")), React.createElement("input", { "ref": fileInputRef, "type": "file", "accept": ".json,application/json", "onChange": handleFileChange, "className": "hidden" }))))
   );
 }
+
 
 
 
@@ -5309,7 +5546,7 @@ __modules.__mod_12 = (function() {
   const React = __modules.__mod_0.default ?? __modules.__mod_0;
                                                                         
                                                            
-const { Layers, Activity, Crosshair } = __modules.__mod_10;
+const { Layers, Crosshair } = __modules.__mod_10;
 
                                        
                              
@@ -5327,67 +5564,77 @@ function LayerTogglesBar({
                   
                   
                         
+                             
      = [
     {
       key: 'showDeformed',
       label: 'Deformed Shape',
       badge: 'u,v',
-      activeClass: 'bg-sky-500/20 text-sky-300 border-sky-400/60',
+      activeClass: 'bg-blue-50 text-blue-700 border-blue-300 shadow-2xs',
+      badgeActiveClass: 'bg-blue-600 text-white',
     },
     {
       key: 'showAxial',
       label: 'Axial Force',
       badge: 'N',
-      activeClass: 'bg-purple-500/20 text-purple-300 border-purple-400/60',
+      activeClass: 'bg-purple-50 text-purple-700 border-purple-300 shadow-2xs',
+      badgeActiveClass: 'bg-purple-600 text-white',
     },
     {
       key: 'showShear',
       label: 'Shear Force',
       badge: 'V',
-      activeClass: 'bg-emerald-500/20 text-emerald-300 border-emerald-400/60',
+      activeClass: 'bg-emerald-50 text-emerald-700 border-emerald-300 shadow-2xs',
+      badgeActiveClass: 'bg-emerald-600 text-white',
     },
     {
       key: 'showMoment',
       label: 'Bending Moment',
       badge: 'M',
-      activeClass: 'bg-rose-500/20 text-rose-300 border-rose-400/60',
+      activeClass: 'bg-red-50 text-red-700 border-red-300 shadow-2xs',
+      badgeActiveClass: 'bg-red-600 text-white',
     },
     {
       key: 'showReactions',
       label: 'Reactions',
       badge: 'R',
-      activeClass: 'bg-teal-500/20 text-teal-300 border-teal-400/60',
+      activeClass: 'bg-teal-50 text-teal-700 border-teal-300 shadow-2xs',
+      badgeActiveClass: 'bg-teal-600 text-white',
     },
     {
       key: 'showHeatmap',
       label: 'Stress Heatmap',
       badge: 'σ/fy',
-      activeClass: 'bg-amber-500/20 text-amber-300 border-amber-400/60',
+      activeClass: 'bg-amber-50 text-amber-800 border-amber-300 shadow-2xs',
+      badgeActiveClass: 'bg-amber-600 text-white',
     },
   ];
 
   return (
-    React.createElement(React.Fragment, null, React.createElement("div", { "id": "result-overlay-toggles", "className": "absolute top-3 left-3 z-10 flex flex-wrap items-center gap-1.5 bg-slate-900/90 backdrop-blur-md border border-slate-700/80 rounded-lg px-2.5 py-1.5 shadow-xl select-none max-w-[calc(100%-24px)]" }, React.createElement("div", { "className": "flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400 pr-1.5 border-r border-slate-700/80" }, React.createElement(Layers, { "size": 13, "className": "text-sky-400" }), React.createElement("span", { "className": "hidden sm:inline" }, "Overlays")), toggleButtons.map((btn) => {
+    React.createElement("div", { "id": "layer-toggles-wrapper" }, React.createElement("div", { "id": "result-overlay-toggles", "className": "absolute top-3 left-3 z-10 flex flex-wrap items-center gap-1.5 bg-white/95 backdrop-blur-md border border-slate-200 rounded-lg px-2.5 py-1.5 shadow-md select-none max-w-[calc(100%-24px)]" }, React.createElement("div", { "className": "flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-slate-500 pr-1.5 border-r border-slate-200" }, React.createElement(Layers, { "size": 13, "className": "text-blue-600" }), React.createElement("span", { "className": "hidden sm:inline" }, "Overlays")), toggleButtons.map((btn) => {
           const isOn = Boolean(layers[btn.key]);
           return (
             React.createElement("button", { "key": btn.key, "id": `layer-toggle-${btn.key}`, "type": "button", "onClick": () => onUpdateLayers({ [btn.key]: !isOn }), "className": `flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium border transition-all cursor-pointer ${
                 isOn
                   ? btn.activeClass
-                  : 'bg-slate-800/60 text-slate-400 border-slate-700/60 hover:text-slate-200 hover:bg-slate-800'
-              }` }, React.createElement("span", { "className": "font-mono text-[10px] font-bold px-1 py-0.2 rounded bg-slate-950/60" }, btn.badge), React.createElement("span", null, btn.label))
+                  : 'bg-slate-50 text-slate-600 border-slate-200 hover:text-slate-900 hover:bg-slate-100'
+              }` }, React.createElement("span", { "className": `font-mono text-[10px] font-bold px-1 py-0.2 rounded ${
+                  isOn ? btn.badgeActiveClass : 'bg-slate-200 text-slate-700'
+                }` }, btn.badge), React.createElement("span", null, btn.label))
           );
-        }), React.createElement("div", { "className": "flex items-center gap-1 pl-1.5 border-l border-slate-700/80" }, React.createElement("span", { "className": "text-[10px] text-slate-400 font-medium hidden md:inline" }, "M Side:"), React.createElement("button", { "id": "moment-convention-toggle", "type": "button", "onClick": () =>
+        }), React.createElement("div", { "className": "flex items-center gap-1 pl-1.5 border-l border-slate-200" }, React.createElement("span", { "className": "text-[10px] text-slate-500 font-medium hidden md:inline" }, "M Side:"), React.createElement("button", { "id": "moment-convention-toggle", "type": "button", "onClick": () =>
               onUpdateLayers({
                 momentSide: layers.momentSide === 'tension' ? 'compression' : 'tension',
               })
-            , "title": "Toggle Bending Moment Diagram Plotting Side: Tension Face (Default) vs Compression Face", "className": "px-2 py-1 rounded text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-rose-300 border border-rose-500/40 cursor-pointer transition-colors" }, layers.momentSide === 'tension' ? 'Tension Face' : 'Compression Face'))), hoverProbe ? (
+            , "title": "Toggle Bending Moment Diagram Plotting Side: Tension Face (Default) vs Compression Face", "className": "px-2 py-1 rounded text-[11px] font-mono font-semibold bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 cursor-pointer transition-colors" }, layers.momentSide === 'tension' ? 'Tension Face' : 'Compression Face'))), hoverProbe ? (
         React.createElement("div", { "id": "interactive-hover-probe", "style": {
             left: `${Math.min(window.innerWidth - 340, Math.max(12, hoverProbe.screenX + 18))}px`,
             top: `${Math.max(64, hoverProbe.screenY - 96)}px`,
-          }, "className": "fixed z-30 pointer-events-none bg-slate-950/95 backdrop-blur-md border border-sky-400/60 rounded-lg px-3 py-2.5 shadow-2xl text-xs font-mono text-slate-100 w-64" }, React.createElement("div", { "className": "flex items-center justify-between border-b border-slate-800 pb-1.5 mb-1.5" }, React.createElement("span", { "className": "flex items-center gap-1.5 font-sans font-bold text-sky-300 text-xs" }, React.createElement(Crosshair, { "size": 13 }), hoverProbe.element.id, " · ", hoverProbe.element.label || 'Member'), React.createElement("span", { "className": "text-[11px] text-slate-400" }, "x = ", hoverProbe.station.x.toFixed(2), " m")), React.createElement("div", { "className": "grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]" }, React.createElement("div", { "className": "flex justify-between" }, React.createElement("span", { "className": "text-purple-300" }, "N(x):"), React.createElement("span", null, hoverProbe.station.N.toFixed(2), " kN")), React.createElement("div", { "className": "flex justify-between" }, React.createElement("span", { "className": "text-emerald-300" }, "V(x):"), React.createElement("span", null, hoverProbe.station.V.toFixed(2), " kN")), React.createElement("div", { "className": "flex justify-between" }, React.createElement("span", { "className": "text-rose-300" }, "M(x):"), React.createElement("span", null, hoverProbe.station.M.toFixed(2), " kNm")), React.createElement("div", { "className": "flex justify-between" }, React.createElement("span", { "className": "text-sky-300" }, "|δ(x)|:"), React.createElement("span", null, hoverProbe.station.deflectionMm.toFixed(2), " mm")), React.createElement("div", { "className": "flex justify-between col-span-2 pt-1 border-t border-slate-800/90" }, React.createElement("span", { "className": "text-amber-300" }, "σ_max(x):"), React.createElement("span", null, hoverProbe.station.sigmaMaxMpa.toFixed(2), " MPa (", (hoverProbe.station.utilization * 100).toFixed(1), "% fy)"))))
+          }, "className": "fixed z-30 pointer-events-none bg-white/95 backdrop-blur-md border border-blue-300 rounded-lg px-3 py-2.5 shadow-xl text-xs font-mono text-slate-800 w-64" }, React.createElement("div", { "className": "flex items-center justify-between border-b border-slate-200 pb-1.5 mb-1.5" }, React.createElement("span", { "className": "flex items-center gap-1.5 font-sans font-bold text-blue-700 text-xs" }, React.createElement(Crosshair, { "size": 13 }), hoverProbe.element.id, " · ", hoverProbe.element.label || 'Member'), React.createElement("span", { "className": "text-[11px] text-slate-500" }, "x = ", hoverProbe.station.x.toFixed(2), " m")), React.createElement("div", { "className": "grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]" }, React.createElement("div", { "className": "flex justify-between" }, React.createElement("span", { "className": "text-purple-700 font-semibold" }, "N(x):"), React.createElement("span", null, hoverProbe.station.N.toFixed(2), " kN")), React.createElement("div", { "className": "flex justify-between" }, React.createElement("span", { "className": "text-emerald-700 font-semibold" }, "V(x):"), React.createElement("span", null, hoverProbe.station.V.toFixed(2), " kN")), React.createElement("div", { "className": "flex justify-between" }, React.createElement("span", { "className": "text-red-600 font-semibold" }, "M(x):"), React.createElement("span", null, hoverProbe.station.M.toFixed(2), " kNm")), React.createElement("div", { "className": "flex justify-between" }, React.createElement("span", { "className": "text-blue-700 font-semibold" }, "|δ(x)|:"), React.createElement("span", null, hoverProbe.station.deflectionMm.toFixed(2), " mm")), React.createElement("div", { "className": "flex justify-between col-span-2 pt-1 border-t border-slate-200" }, React.createElement("span", { "className": "text-amber-700 font-semibold" }, "σ_max(x):"), React.createElement("span", null, hoverProbe.station.sigmaMaxMpa.toFixed(2), " MPa (", (hoverProbe.station.utilization * 100).toFixed(1), "% fy)"))))
       ) : null)
   );
 }
+
 
 
 
@@ -5404,10 +5651,12 @@ __modules.__mod_13 = (function() {
                  
                  
                  
+            
                     
                      
                 
                           
+                        
                            
 const {
   computeCrossSection,
@@ -5437,12 +5686,12 @@ function CrossSectionPreviewSvg({ element }                             ) {
   const rScaled = (d * scale) / 2;
 
   return (
-    React.createElement("div", { "className": "flex flex-col items-center justify-center bg-slate-950/90 border border-slate-800 rounded-lg p-2 w-24 h-24 shrink-0" }, React.createElement("svg", { "width": "72", "height": "72", "viewBox": "-38 -38 76 76", "className": "overflow-visible" }, React.createElement("line", { "x1": "-34", "y1": "0", "x2": "34", "y2": "0", "stroke": "rgba(56, 189, 248, 0.35)", "strokeWidth": "1", "strokeDasharray": "3 2" }), shape === 'rectangular' || shape === 'custom' ? (
-          React.createElement("rect", { "x": -wScaled / 2, "y": -hScaled / 2, "width": wScaled, "height": hScaled, "fill": "rgba(56, 189, 248, 0.22)", "stroke": "#38bdf8", "strokeWidth": "1.6" })
+    React.createElement("div", { "className": "flex flex-col items-center justify-center bg-slate-50 border border-slate-200 rounded-lg p-2 w-24 h-24 shrink-0" }, React.createElement("svg", { "width": "72", "height": "72", "viewBox": "-38 -38 76 76", "className": "overflow-visible" }, React.createElement("line", { "x1": "-34", "y1": "0", "x2": "34", "y2": "0", "stroke": "rgba(37, 99, 235, 0.35)", "strokeWidth": "1", "strokeDasharray": "3 2" }), shape === 'rectangular' || shape === 'custom' ? (
+          React.createElement("rect", { "x": -wScaled / 2, "y": -hScaled / 2, "width": wScaled, "height": hScaled, "fill": "rgba(37, 99, 235, 0.16)", "stroke": "#2563eb", "strokeWidth": "1.6" })
         ) : null, shape === 'circular' ? (
-          React.createElement("circle", { "cx": "0", "cy": "0", "r": rScaled, "fill": "rgba(56, 189, 248, 0.22)", "stroke": "#38bdf8", "strokeWidth": "1.6" })
+          React.createElement("circle", { "cx": "0", "cy": "0", "r": rScaled, "fill": "rgba(37, 99, 235, 0.16)", "stroke": "#2563eb", "strokeWidth": "1.6" })
         ) : null, shape === 'hollow_rect' ? (
-          React.createElement("g", null, React.createElement("rect", { "x": -wScaled / 2, "y": -hScaled / 2, "width": wScaled, "height": hScaled, "fill": "rgba(56, 189, 248, 0.22)", "stroke": "#38bdf8", "strokeWidth": "1.6" }), React.createElement("rect", { "x": -(wScaled - 2 * Math.max(3, t * scale)) / 2, "y": -(hScaled - 2 * Math.max(3, t * scale)) / 2, "width": Math.max(4, wScaled - 2 * Math.max(3, t * scale)), "height": Math.max(4, hScaled - 2 * Math.max(3, t * scale)), "fill": "#020617", "stroke": "#38bdf8", "strokeWidth": "1.2" }))
+          React.createElement("g", null, React.createElement("rect", { "x": -wScaled / 2, "y": -hScaled / 2, "width": wScaled, "height": hScaled, "fill": "rgba(37, 99, 235, 0.16)", "stroke": "#2563eb", "strokeWidth": "1.6" }), React.createElement("rect", { "x": -(wScaled - 2 * Math.max(3, t * scale)) / 2, "y": -(hScaled - 2 * Math.max(3, t * scale)) / 2, "width": Math.max(4, wScaled - 2 * Math.max(3, t * scale)), "height": Math.max(4, hScaled - 2 * Math.max(3, t * scale)), "fill": "#ffffff", "stroke": "#2563eb", "strokeWidth": "1.2" }))
         ) : null, shape === 'i_section' ? (
           React.createElement("path", { "d": (() => {
               const hw = wScaled / 2;
@@ -5451,8 +5700,56 @@ function CrossSectionPreviewSvg({ element }                             ) {
               const twS = Math.max(2.5, tw * scale);
               const htw = twS / 2;
               return `M ${-hw} ${-hh} H ${hw} V ${-hh + tfS} H ${htw} V ${hh - tfS} H ${hw} V ${hh} H ${-hw} V ${hh - tfS} H ${-htw} V ${-hh + tfS} H ${-hw} Z`;
-            })(), "fill": "rgba(56, 189, 248, 0.25)", "stroke": "#38bdf8", "strokeWidth": "1.5" })
+            })(), "fill": "rgba(37, 99, 235, 0.18)", "stroke": "#2563eb", "strokeWidth": "1.5" })
         ) : null))
+  );
+}
+
+/**
+ * Shared Entity Switcher Strip for Busy Nodes:
+ * Lists the Node & Support plus all Nodal Loads and Connected Members attached to `node`,
+ * allowing instant one-click switching or adding a new Nodal Load.
+ */
+function NodeEntitySwitcher({
+  node,
+  model,
+  activeKind,
+  activeId,
+  onSelectEntity,
+  onQuickAddNodalLoad,
+}   
+                       
+                         
+                              
+                   
+                                                                         
+                                                
+ ) {
+  const attachedNodalLoads = model.loads.filter(
+    (l)                 => l.kind === 'nodal' && l.nodeId === node.id
+  );
+  const connectedMembers = model.elements.filter(
+    (e)                      =>
+      e.kind === 'frame2d' && (e.nodeI === node.id || e.nodeJ === node.id)
+  );
+
+  return (
+    React.createElement("div", { "id": "node-entity-switcher", "className": "mb-2.5 p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1.5" }, React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("span", { "className": "text-[10px] font-mono font-semibold uppercase tracking-wider text-slate-500" }, "Entities at Node ", node.id), React.createElement("button", { "type": "button", "onClick": () => onQuickAddNodalLoad(node.id), "title": "Add a concentrated Nodal Force/Moment on this node", "className": "flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 cursor-pointer" }, React.createElement(Plus, { "size": 11 }), React.createElement("span", null, "+ Nodal Load"))), React.createElement("div", { "className": "flex flex-wrap items-center gap-1" }, React.createElement("button", { "type": "button", "onClick": () => onSelectEntity('node', node.id), "className": `px-2 py-1 rounded text-[11px] font-mono font-semibold border cursor-pointer transition-colors ${
+            activeKind === 'node' && activeId === node.id
+              ? 'bg-teal-600 text-white border-teal-600 shadow-2xs'
+              : 'bg-white text-teal-700 border-teal-300 hover:bg-teal-50'
+          }` }, "Node ", node.id, " (", node.support, ")"), attachedNodalLoads.map((ld, idx) => {
+          const isCurrent = activeKind === 'load' && activeId === ld.id;
+          return (
+            React.createElement("button", { "key": ld.id, "type": "button", "onClick": () => onSelectEntity('load', ld.id), "className": `px-2 py-1 rounded text-[11px] font-mono font-semibold border cursor-pointer transition-colors ${
+                isCurrent
+                  ? 'bg-amber-600 text-white border-amber-600 shadow-2xs'
+                  : 'bg-white text-amber-800 border-amber-300 hover:bg-amber-50'
+              }` }, "Load #", idx + 1, " (", ld.id, ")")
+          );
+        }), connectedMembers.map((m) => (
+          React.createElement("button", { "key": m.id, "type": "button", "onClick": () => onSelectEntity('member', m.id), "title": `Inspect Connected Member ${m.id}`, "className": "px-2 py-1 rounded text-[11px] font-mono font-medium bg-white text-blue-700 border border-blue-200 hover:bg-blue-50 cursor-pointer transition-colors" }, m.id)
+        ))))
   );
 }
 
@@ -5465,16 +5762,12 @@ function CrossSectionPreviewSvg({ element }                             ) {
                       
                              
                    
-         
-                      
-                  
-                        
-                         
-                         
+                                        
                     
             
                                                                                        
                                                 
+                                                                         
  
 
 function ContextualPopup({
@@ -5488,6 +5781,7 @@ function ContextualPopup({
   onPinParameter,
   onQuickAddMemberLoad,
   onQuickAddNodalLoad,
+  onSelectEntity,
 }                      ) {
   if (selectedElementId) {
     const el = model.elements.find(
@@ -5614,33 +5908,33 @@ function ContextualPopup({
     const dims = el.section.dimensions;
 
     return (
-      React.createElement("div", { "id": "contextual-member-popup", "className": "absolute bottom-4 left-4 z-20 w-[410px] max-w-[calc(100vw-32px)] bg-slate-900/95 backdrop-blur-md border border-sky-500/40 rounded-xl shadow-2xl text-slate-100 p-3.5 select-none" }, React.createElement("div", { "className": "flex items-center justify-between pb-2 mb-2.5 border-b border-slate-800" }, React.createElement("div", null, React.createElement("span", { "className": "text-[10px] font-mono uppercase tracking-wider text-sky-400 block" }, "1D Frame Element Inspector"), React.createElement("h3", { "className": "text-sm font-bold text-slate-100" }, el.id, " · ", el.label || 'Structural Member', " (", nodeI.id, " → ", nodeJ.id, ")")), React.createElement("div", { "className": "flex items-center gap-1" }, React.createElement("button", { "type": "button", "onClick": onDeleteEntity, "title": "Delete Member", "className": "p-1.5 rounded-md text-rose-400 hover:bg-rose-500/20 cursor-pointer" }, React.createElement(Trash2, { "size": 14 })), React.createElement("button", { "type": "button", "onClick": onClose, "title": "Close Inspector", "className": "p-1.5 rounded-md text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer" }, React.createElement(X, { "size": 15 })))), React.createElement("div", { "className": "grid grid-cols-5 gap-2 mb-3 bg-slate-950/60 p-2 rounded-lg border border-slate-800/80 text-xs" }, React.createElement("div", { "className": "col-span-1" }, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Length (m)"), React.createElement("input", { "type": "number", "step": "0.1", "min": "0.1", "value": Number(lengthM.toFixed(3)), "onChange": (e     ) => handleLengthChange( parseFloat(e.target.value) ), "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs text-sky-300" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, nodeI.id, " X (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": nodeI.x, "onChange": (e     ) => handleNodeCoordChange('I', 'x', parseFloat(e.target.value)), "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, nodeI.id, " Y (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": nodeI.y, "onChange": (e     ) => handleNodeCoordChange('I', 'y', parseFloat(e.target.value)), "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, nodeJ.id, " X (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": nodeJ.x, "onChange": (e     ) => handleNodeCoordChange('J', 'x', parseFloat(e.target.value)), "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, nodeJ.id, " Y (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": nodeJ.y, "onChange": (e     ) => handleNodeCoordChange('J', 'y', parseFloat(e.target.value)), "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" }))), React.createElement("div", { "className": "flex gap-3 mb-3" }, React.createElement(CrossSectionPreviewSvg, { "element": el }), React.createElement("div", { "className": "flex-1 space-y-2" }, React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("label", { "className": "text-[11px] font-medium text-slate-300" }, "Cross-Section:"), React.createElement("select", { "value": el.section.shape, "onChange": (e     ) => handleShapeChange(e.target.value                     ), "className": "bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100" }, React.createElement("option", { "value": "rectangular" }, "Rectangular (b × h)"), React.createElement("option", { "value": "circular" }, "Circular (Ø d)"), React.createElement("option", { "value": "hollow_rect" }, "Hollow Tube (b × h × t)"), React.createElement("option", { "value": "i_section" }, "I-Section (h × b × tw × tf)"), React.createElement("option", { "value": "custom" }, "Custom (A, I, S)"))), el.section.shape === 'rectangular' ? (
-              React.createElement("div", { "className": "grid grid-cols-2 gap-2" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "Width b (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.b ?? 300, "onChange": (e     ) => handleDimChange('b', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "Depth h (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.h ?? 500, "onChange": (e     ) => handleDimChange('h', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs" })))
+      React.createElement("div", { "id": "contextual-member-popup", "className": "absolute bottom-9 left-4 z-20 w-[420px] max-w-[calc(100vw-32px)] bg-white/95 backdrop-blur-md border border-slate-200 rounded-xl shadow-xl text-slate-900 p-3.5 select-none" }, React.createElement("div", { "className": "flex items-center justify-between pb-2 mb-2.5 border-b border-slate-200" }, React.createElement("div", null, React.createElement("span", { "className": "text-[10px] font-mono font-semibold uppercase tracking-wider text-blue-600 block" }, "1D Frame Element Inspector"), React.createElement("h3", { "className": "text-sm font-bold text-slate-900" }, el.id, " · ", el.label || 'Structural Member', " (", nodeI.id, " → ", nodeJ.id, ")")), React.createElement("div", { "className": "flex items-center gap-1" }, React.createElement("button", { "type": "button", "onClick": onDeleteEntity, "title": "Delete Member", "className": "p-1.5 rounded-md text-red-600 hover:bg-red-50 cursor-pointer" }, React.createElement(Trash2, { "size": 14 })), React.createElement("button", { "type": "button", "onClick": onClose, "title": "Close Inspector", "className": "p-1.5 rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 cursor-pointer" }, React.createElement(X, { "size": 15 })))), React.createElement("div", { "className": "grid grid-cols-5 gap-2 mb-3 bg-slate-50 p-2 rounded-lg border border-slate-200 text-xs" }, React.createElement("div", { "className": "col-span-1" }, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Length (m)"), React.createElement("input", { "type": "number", "step": "0.1", "min": "0.1", "value": Number(lengthM.toFixed(3)), "onChange": (e     ) => handleLengthChange(parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-blue-700 font-semibold" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, nodeI.id, " X (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": nodeI.x, "onChange": (e     ) => handleNodeCoordChange('I', 'x', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, nodeI.id, " Y (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": nodeI.y, "onChange": (e     ) => handleNodeCoordChange('I', 'y', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, nodeJ.id, " X (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": nodeJ.x, "onChange": (e     ) => handleNodeCoordChange('J', 'x', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, nodeJ.id, " Y (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": nodeJ.y, "onChange": (e     ) => handleNodeCoordChange('J', 'y', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" }))), React.createElement("div", { "className": "flex gap-3 mb-3" }, React.createElement(CrossSectionPreviewSvg, { "element": el }), React.createElement("div", { "className": "flex-1 space-y-2" }, React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("label", { "className": "text-[11px] font-semibold text-slate-700" }, "Cross-Section:"), React.createElement("select", { "value": el.section.shape, "onChange": (e     ) => handleShapeChange(e.target.value                     ), "className": "bg-white border border-slate-300 rounded px-2 py-1 text-xs text-slate-900" }, React.createElement("option", { "value": "rectangular" }, "Rectangular (b × h)"), React.createElement("option", { "value": "circular" }, "Circular (Ø d)"), React.createElement("option", { "value": "hollow_rect" }, "Hollow Tube (b × h × t)"), React.createElement("option", { "value": "i_section" }, "I-Section (h × b × tw × tf)"), React.createElement("option", { "value": "custom" }, "Custom (A, I, S)"))), el.section.shape === 'rectangular' ? (
+              React.createElement("div", { "className": "grid grid-cols-2 gap-2" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "Width b (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.b ?? 300, "onChange": (e     ) => handleDimChange('b', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "Depth h (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.h ?? 500, "onChange": (e     ) => handleDimChange('h', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" })))
             ) : null, el.section.shape === 'circular' ? (
-              React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "Diameter d (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.d ?? 300, "onChange": (e     ) => handleDimChange('d', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs" }))
+              React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "Diameter d (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.d ?? 300, "onChange": (e     ) => handleDimChange('d', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" }))
             ) : null, el.section.shape === 'hollow_rect' ? (
-              React.createElement("div", { "className": "grid grid-cols-3 gap-1.5" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "b (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.b ?? 200, "onChange": (e     ) => handleDimChange('b', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "h (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.h ?? 300, "onChange": (e     ) => handleDimChange('h', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "Wall t (mm)"), React.createElement("input", { "type": "number", "step": "1", "value": dims.t ?? 12, "onChange": (e     ) => handleDimChange('t', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })))
+              React.createElement("div", { "className": "grid grid-cols-3 gap-1.5" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "b (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.b ?? 200, "onChange": (e     ) => handleDimChange('b', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "h (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.h ?? 300, "onChange": (e     ) => handleDimChange('h', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "Wall t (mm)"), React.createElement("input", { "type": "number", "step": "1", "value": dims.t ?? 12, "onChange": (e     ) => handleDimChange('t', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })))
             ) : null, el.section.shape === 'i_section' ? (
-              React.createElement("div", { "className": "grid grid-cols-4 gap-1.5" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "h (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.h ?? 360, "onChange": (e     ) => handleDimChange('h', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "b (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.b ?? 170, "onChange": (e     ) => handleDimChange('b', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "tw (mm)"), React.createElement("input", { "type": "number", "step": "0.5", "value": dims.tw ?? 8, "onChange": (e     ) => handleDimChange('tw', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "tf (mm)"), React.createElement("input", { "type": "number", "step": "0.5", "value": dims.tf ?? 12.7, "onChange": (e     ) => handleDimChange('tf', parseFloat(e.target.value)), "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })))
+              React.createElement("div", { "className": "grid grid-cols-4 gap-1.5" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "h (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.h ?? 360, "onChange": (e     ) => handleDimChange('h', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "b (mm)"), React.createElement("input", { "type": "number", "step": "10", "value": dims.b ?? 170, "onChange": (e     ) => handleDimChange('b', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "tw (mm)"), React.createElement("input", { "type": "number", "step": "0.5", "value": dims.tw ?? 8, "onChange": (e     ) => handleDimChange('tw', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "tf (mm)"), React.createElement("input", { "type": "number", "step": "0.5", "value": dims.tf ?? 12.7, "onChange": (e     ) => handleDimChange('tf', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })))
             ) : null, el.section.shape === 'custom' ? (
-              React.createElement("div", { "className": "grid grid-cols-3 gap-1.5" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "A (mm²)"), React.createElement("input", { "type": "number", "step": "100", "value": el.section.A, "onChange": (e     ) =>
+              React.createElement("div", { "className": "grid grid-cols-3 gap-1.5" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "A (mm²)"), React.createElement("input", { "type": "number", "step": "100", "value": el.section.A, "onChange": (e     ) =>
                       handleCustomSectionPropChange('A', parseFloat(e.target.value))
-                    , "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "I (mm⁴)"), React.createElement("input", { "type": "number", "step": "1000000", "value": el.section.I, "onChange": (e     ) =>
+                    , "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "I (mm⁴)"), React.createElement("input", { "type": "number", "step": "1000000", "value": el.section.I, "onChange": (e     ) =>
                       handleCustomSectionPropChange('I', parseFloat(e.target.value))
-                    , "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block" }, "S (mm³)"), React.createElement("input", { "type": "number", "step": "10000", "value": el.section.S, "onChange": (e     ) =>
+                    , "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block" }, "S (mm³)"), React.createElement("input", { "type": "number", "step": "10000", "value": el.section.S, "onChange": (e     ) =>
                       handleCustomSectionPropChange('S', parseFloat(e.target.value))
-                    , "className": "w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })))
-            ) : null, React.createElement("div", { "className": "flex items-center justify-between text-[10px] font-mono text-slate-400 bg-slate-950/70 px-2 py-1 rounded border border-slate-800/80" }, React.createElement("span", null, "A=", el.section.A.toExponential(2), " mm²"), React.createElement("span", null, "I=", el.section.I.toExponential(2), " mm⁴"), React.createElement("span", null, "S=", el.section.S.toExponential(2), " mm³")))), React.createElement("div", { "className": "grid grid-cols-3 gap-2 mb-3 bg-slate-950/60 p-2 rounded-lg border border-slate-800/80" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Material Preset"), React.createElement("select", { "value": el.material.preset, "onChange": (e     ) =>
+                    , "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })))
+            ) : null, React.createElement("div", { "className": "flex items-center justify-between text-[10px] font-mono text-slate-600 bg-slate-50 px-2 py-1 rounded border border-slate-200" }, React.createElement("span", null, "A=", el.section.A.toExponential(2), " mm²"), React.createElement("span", null, "I=", el.section.I.toExponential(2), " mm⁴"), React.createElement("span", null, "S=", el.section.S.toExponential(2), " mm³")))), React.createElement("div", { "className": "grid grid-cols-3 gap-2 mb-3 bg-slate-50 p-2 rounded-lg border border-slate-200" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Material Preset"), React.createElement("select", { "value": el.material.preset, "onChange": (e     ) =>
                 handleMaterialPresetChange(e.target.value                      )
-              , "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-xs" }, React.createElement("option", { "value": "steel" }, "Steel (200 GPa)"), React.createElement("option", { "value": "concrete" }, "Concrete (30 GPa)"), React.createElement("option", { "value": "timber" }, "Timber (11 GPa)"), React.createElement("option", { "value": "custom" }, "Custom E, fy"))), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Modulus E (GPa)"), React.createElement("input", { "type": "number", "step": "5", "min": "0.5", "value": el.material.E, "onChange": (e     ) => handleMaterialPropChange('E', parseFloat(e.target.value)), "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Yield fy (MPa)"), React.createElement("input", { "type": "number", "step": "5", "min": "1", "value": el.material.fy, "onChange": (e     ) => handleMaterialPropChange('fy', parseFloat(e.target.value)), "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" }))), React.createElement("div", { "className": "flex flex-wrap items-center justify-between gap-2 pt-1" }, React.createElement("div", { "className": "flex items-center gap-2" }, React.createElement("button", { "type": "button", "onClick": () => toggleHinge('releaseStart'), "className": `px-2.5 py-1 rounded text-xs font-medium border cursor-pointer transition-colors ${
+              , "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 text-xs text-slate-900" }, React.createElement("option", { "value": "steel" }, "Steel (200 GPa)"), React.createElement("option", { "value": "concrete" }, "Concrete (30 GPa)"), React.createElement("option", { "value": "timber" }, "Timber (11 GPa)"), React.createElement("option", { "value": "custom" }, "Custom E, fy"))), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Modulus E (GPa)"), React.createElement("input", { "type": "number", "step": "5", "min": "0.5", "value": el.material.E, "onChange": (e     ) => handleMaterialPropChange('E', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Yield fy (MPa)"), React.createElement("input", { "type": "number", "step": "5", "min": "1", "value": el.material.fy, "onChange": (e     ) => handleMaterialPropChange('fy', parseFloat(e.target.value)), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" }))), React.createElement("div", { "className": "flex flex-wrap items-center justify-between gap-2 pt-1" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement("button", { "type": "button", "onClick": () => toggleHinge('releaseStart'), "className": `px-2.5 py-1 rounded text-xs font-medium border cursor-pointer transition-colors ${
                 el.releaseStart
-                  ? 'bg-amber-500/20 text-amber-300 border-amber-400/60'
-                  : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-slate-200'
+                  ? 'bg-amber-50 text-amber-800 border-amber-300 font-semibold'
+                  : 'bg-slate-50 text-slate-600 border-slate-300 hover:text-slate-900'
               }` }, "○ Start Hinge (", nodeI.id, ")"), React.createElement("button", { "type": "button", "onClick": () => toggleHinge('releaseEnd'), "className": `px-2.5 py-1 rounded text-xs font-medium border cursor-pointer transition-colors ${
                 el.releaseEnd
-                  ? 'bg-amber-500/20 text-amber-300 border-amber-400/60'
-                  : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-slate-200'
-              }` }, "○ End Hinge (", nodeJ.id, ")")), React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement("button", { "type": "button", "onClick": () => onPinParameter('member_depth', el.id), "title": "Pin Section Depth (h) to Real-Time Sensitivity Slider", "className": "flex items-center gap-1 px-2 py-1 rounded text-[11px] bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border border-sky-400/40 cursor-pointer" }, React.createElement(Pin, { "size": 11 }), React.createElement("span", null, "Pin h")), React.createElement("button", { "type": "button", "onClick": () => onPinParameter('member_E', el.id), "title": "Pin Young's Modulus (E) to Real-Time Sensitivity Slider", "className": "flex items-center gap-1 px-2 py-1 rounded text-[11px] bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border border-sky-400/40 cursor-pointer" }, React.createElement(Pin, { "size": 11 }), React.createElement("span", null, "Pin E")), React.createElement("button", { "type": "button", "onClick": () => onQuickAddMemberLoad(el.id, 'distributed'), "title": "Add Distributed Load on this Member", "className": "flex items-center gap-1 px-2 py-1 rounded text-[11px] bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-400/40 cursor-pointer" }, React.createElement(Plus, { "size": 11 }), React.createElement("span", null, "Add Load")))))
+                  ? 'bg-amber-50 text-amber-800 border-amber-300 font-semibold'
+                  : 'bg-slate-50 text-slate-600 border-slate-300 hover:text-slate-900'
+              }` }, "○ End Hinge (", nodeJ.id, ")")), React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement("button", { "type": "button", "onClick": () => onPinParameter('member_E', el.id), "title": "Pin Young's Modulus (E) to Real-Time Sensitivity Slider", "className": "flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-300 cursor-pointer" }, React.createElement(Pin, { "size": 11 }), React.createElement("span", null, "Pin E")), React.createElement("button", { "type": "button", "onClick": () => onQuickAddMemberLoad(el.id, 'distributed'), "title": "Add Distributed Load on this Member", "className": "flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 cursor-pointer" }, React.createElement(Plus, { "size": 11 }), React.createElement("span", null, "Add Load")))))
     );
   }
 
@@ -5671,36 +5965,39 @@ function ContextualPopup({
     };
 
     return (
-      React.createElement("div", { "id": "contextual-node-popup", "className": "absolute bottom-4 left-4 z-20 w-[370px] max-w-[calc(100vw-32px)] bg-slate-900/95 backdrop-blur-md border border-teal-500/40 rounded-xl shadow-2xl text-slate-100 p-3.5 select-none" }, React.createElement("div", { "className": "flex items-center justify-between pb-2 mb-2.5 border-b border-slate-800" }, React.createElement("div", null, React.createElement("span", { "className": "text-[10px] font-mono uppercase tracking-wider text-teal-400 block" }, "Node & Support Inspector"), React.createElement("h3", { "className": "text-sm font-bold text-slate-100" }, node.id, " · ", node.label || 'Structural Node', " (z = 0.0 m)")), React.createElement("div", { "className": "flex items-center gap-1" }, React.createElement("button", { "type": "button", "onClick": onDeleteEntity, "title": "Delete Node", "className": "p-1.5 rounded-md text-rose-400 hover:bg-rose-500/20 cursor-pointer" }, React.createElement(Trash2, { "size": 14 })), React.createElement("button", { "type": "button", "onClick": onClose, "className": "p-1.5 rounded-md text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer" }, React.createElement(X, { "size": 15 })))), React.createElement("div", { "className": "grid grid-cols-4 gap-2 mb-3 bg-slate-950/60 p-2 rounded-lg border border-slate-800/80" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "X (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": node.x, "onChange": (e     ) => updateNode({ x: parseFloat(e.target.value) || 0 }), "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Y (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": node.y, "onChange": (e     ) => updateNode({ y: parseFloat(e.target.value) || 0 }), "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-sky-400 block mb-0.5" }, "Polar r (m)"), React.createElement("input", { "type": "number", "step": "0.1", "min": "0", "value": polar.r, "onChange": (e     ) =>
+      React.createElement("div", { "id": "contextual-node-popup", "className": "absolute bottom-9 left-4 z-20 w-[390px] max-w-[calc(100vw-32px)] bg-white/95 backdrop-blur-md border border-slate-200 rounded-xl shadow-xl text-slate-900 p-3.5 select-none" }, React.createElement("div", { "className": "flex items-center justify-between pb-2 mb-2.5 border-b border-slate-200" }, React.createElement("div", null, React.createElement("span", { "className": "text-[10px] font-mono font-semibold uppercase tracking-wider text-teal-700 block" }, "Node & Support Inspector"), React.createElement("h3", { "className": "text-sm font-bold text-slate-900" }, node.id, " · ", node.label || 'Structural Node', " (z = 0.0 m)")), React.createElement("div", { "className": "flex items-center gap-1" }, React.createElement("button", { "type": "button", "onClick": onDeleteEntity, "title": "Delete Node", "className": "p-1.5 rounded-md text-red-600 hover:bg-red-50 cursor-pointer" }, React.createElement(Trash2, { "size": 14 })), React.createElement("button", { "type": "button", "onClick": onClose, "className": "p-1.5 rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 cursor-pointer" }, React.createElement(X, { "size": 15 })))), React.createElement(NodeEntitySwitcher, { "node": node, "model": model, "activeKind": "node", "activeId": node.id, "onSelectEntity": onSelectEntity, "onQuickAddNodalLoad": onQuickAddNodalLoad }), React.createElement("div", { "className": "grid grid-cols-4 gap-2 mb-3 bg-slate-50 p-2 rounded-lg border border-slate-200" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "X (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": node.x, "onChange": (e     ) => updateNode({ x: parseFloat(e.target.value) || 0 }), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Y (m)"), React.createElement("input", { "type": "number", "step": "0.1", "value": node.y, "onChange": (e     ) => updateNode({ y: parseFloat(e.target.value) || 0 }), "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-blue-600 block mb-0.5" }, "Polar r (m)"), React.createElement("input", { "type": "number", "step": "0.1", "min": "0", "value": polar.r, "onChange": (e     ) =>
                 handlePolarInput(parseFloat(e.target.value) || 0, polar.thetaDeg)
-              , "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs text-sky-300" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-sky-400 block mb-0.5" }, "Angle θ (°)"), React.createElement("input", { "type": "number", "step": "5", "value": polar.thetaDeg, "onChange": (e     ) =>
+              , "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-blue-700" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-blue-600 block mb-0.5" }, "Angle θ (°)"), React.createElement("input", { "type": "number", "step": "5", "value": polar.thetaDeg, "onChange": (e     ) =>
                 handlePolarInput(polar.r, parseFloat(e.target.value) || 0)
-              , "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs text-sky-300" }))), React.createElement("div", { "className": "space-y-2 mb-3" }, React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("label", { "className": "text-xs font-medium text-slate-300" }, "Support Preset:"), React.createElement("select", { "value": node.support, "onChange": (e     ) => handleSupportChange(e.target.value                 ), "className": "bg-slate-800 border border-slate-700 rounded px-2.5 py-1 text-xs text-slate-100" }, React.createElement("option", { "value": "none" }, "Free Joint (No Rigid Restraint)"), React.createElement("option", { "value": "fixed" }, "Fixed (ux, uy, θz fixed)"), React.createElement("option", { "value": "pinned" }, "Pinned (ux, uy fixed)"), React.createElement("option", { "value": "rollerX" }, "Roller X (uy fixed, rolls along X)"), React.createElement("option", { "value": "rollerY" }, "Roller Y (ux fixed, rolls along Y)"), React.createElement("option", { "value": "inclinedRoller" }, "Custom Inclined Roller (Angle α)"))), node.support === 'inclinedRoller' ? (
-            React.createElement("div", { "className": "flex items-center justify-between bg-teal-950/40 border border-teal-500/40 rounded px-2.5 py-1.5" }, React.createElement("label", { "className": "text-xs text-teal-200" }, "Incline Angle α (deg):"), React.createElement("input", { "type": "number", "step": "5", "min": "-180", "max": "180", "value": node.inclinedAngleDeg ?? 30, "onChange": (e     ) =>
+              , "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-blue-700" }))), React.createElement("div", { "className": "space-y-2 mb-3" }, React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("label", { "className": "text-xs font-semibold text-slate-700" }, "Support Preset:"), React.createElement("select", { "value": node.support, "onChange": (e     ) => handleSupportChange(e.target.value                 ), "className": "bg-white border border-slate-300 rounded px-2.5 py-1 text-xs text-slate-900" }, React.createElement("option", { "value": "none" }, "Free Joint (No Rigid Restraint)"), React.createElement("option", { "value": "fixed" }, "Fixed (ux, uy, θz fixed)"), React.createElement("option", { "value": "pinned" }, "Pinned (ux, uy fixed)"), React.createElement("option", { "value": "rollerX" }, "Roller X (uy fixed, rolls along X)"), React.createElement("option", { "value": "rollerY" }, "Roller Y (ux fixed, rolls along Y)"), React.createElement("option", { "value": "inclinedRoller" }, "Custom Inclined Roller (Angle α)"))), node.support === 'inclinedRoller' ? (
+            React.createElement("div", { "className": "flex items-center justify-between bg-teal-50 border border-teal-300 rounded px-2.5 py-1.5" }, React.createElement("label", { "className": "text-xs font-medium text-teal-800" }, "Incline Angle α (deg):"), React.createElement("input", { "type": "number", "step": "5", "min": "-180", "max": "180", "value": node.inclinedAngleDeg ?? 30, "onChange": (e     ) =>
                   updateNode({ inclinedAngleDeg: parseFloat(e.target.value) || 0 })
-                , "className": "w-24 bg-slate-900 border border-teal-500/50 rounded px-2 py-0.5 font-mono text-xs text-teal-200" }))
-          ) : null), React.createElement("div", { "className": "bg-slate-950/60 p-2 rounded-lg border border-slate-800/80 mb-3" }, React.createElement("span", { "className": "text-[10px] font-mono uppercase tracking-wider text-purple-300 block mb-1.5" }, "Elastic Nodal Springs (Added to Global [K] Diagonal)"), React.createElement("div", { "className": "grid grid-cols-3 gap-2" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "kx (kN/m)"), React.createElement("input", { "type": "number", "step": "1000", "min": "0", "value": node.springs.kx, "onChange": (e     ) =>
+                , "className": "w-24 bg-white border border-teal-400 rounded px-2 py-0.5 font-mono text-xs text-teal-900" }))
+          ) : null), React.createElement("div", { "className": "bg-slate-50 p-2 rounded-lg border border-slate-200 mb-3" }, React.createElement("span", { "className": "text-[10px] font-mono font-semibold uppercase tracking-wider text-purple-700 block mb-1.5" }, "Elastic Nodal Springs (Added to Global [K] Diagonal)"), React.createElement("div", { "className": "grid grid-cols-3 gap-2" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "kx (kN/m)"), React.createElement("input", { "type": "number", "step": "1000", "min": "0", "value": node.springs.kx, "onChange": (e     ) =>
                   updateNode({
                     springs: { ...node.springs, kx: Math.max(0, parseFloat(e.target.value) || 0) },
                   })
-                , "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "ky (kN/m)"), React.createElement("input", { "type": "number", "step": "1000", "min": "0", "value": node.springs.ky, "onChange": (e     ) =>
+                , "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "ky (kN/m)"), React.createElement("input", { "type": "number", "step": "1000", "min": "0", "value": node.springs.ky, "onChange": (e     ) =>
                   updateNode({
                     springs: { ...node.springs, ky: Math.max(0, parseFloat(e.target.value) || 0) },
                   })
-                , "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "kθ (kNm/rad)"), React.createElement("input", { "type": "number", "step": "1000", "min": "0", "value": node.springs.krz, "onChange": (e     ) =>
+                , "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "kθ (kNm/rad)"), React.createElement("input", { "type": "number", "step": "1000", "min": "0", "value": node.springs.krz, "onChange": (e     ) =>
                   updateNode({
                     springs: {
                       ...node.springs,
                       krz: Math.max(0, parseFloat(e.target.value) || 0),
                     },
                   })
-                , "className": "w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" })))), React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement("button", { "type": "button", "onClick": () => onPinParameter('node_spring_ky', node.id), "className": "flex items-center gap-1 px-2 py-1 rounded text-[11px] bg-purple-500/15 hover:bg-purple-500/25 text-purple-300 border border-purple-400/40 cursor-pointer" }, React.createElement(Pin, { "size": 11 }), React.createElement("span", null, "Pin ky")), React.createElement("button", { "type": "button", "onClick": () => onPinParameter('node_spring_krz', node.id), "className": "flex items-center gap-1 px-2 py-1 rounded text-[11px] bg-purple-500/15 hover:bg-purple-500/25 text-purple-300 border border-purple-400/40 cursor-pointer" }, React.createElement(Pin, { "size": 11 }), React.createElement("span", null, "Pin kθ"))), React.createElement("button", { "type": "button", "onClick": () => onQuickAddNodalLoad(node.id), "className": "flex items-center gap-1 px-2.5 py-1 rounded text-[11px] bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-400/40 cursor-pointer" }, React.createElement(Plus, { "size": 11 }), React.createElement("span", null, "Add Nodal Force"))))
+                , "className": "w-full bg-white border border-slate-300 rounded px-1.5 py-1 font-mono text-xs text-slate-900" })))), React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement("button", { "type": "button", "onClick": () => onPinParameter('node_spring_kx', node.id), "className": "flex items-center gap-1 px-2 py-1 rounded text-[11px] font-semibold bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-300 cursor-pointer" }, React.createElement(Pin, { "size": 11 }), React.createElement("span", null, "Pin kx")), React.createElement("button", { "type": "button", "onClick": () => onPinParameter('node_spring_ky', node.id), "className": "flex items-center gap-1 px-2 py-1 rounded text-[11px] font-semibold bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-300 cursor-pointer" }, React.createElement(Pin, { "size": 11 }), React.createElement("span", null, "Pin ky")), React.createElement("button", { "type": "button", "onClick": () => onPinParameter('node_spring_krz', node.id), "className": "flex items-center gap-1 px-2 py-1 rounded text-[11px] font-semibold bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-300 cursor-pointer" }, React.createElement(Pin, { "size": 11 }), React.createElement("span", null, "Pin kθ"))), React.createElement("button", { "type": "button", "onClick": () => onQuickAddNodalLoad(node.id), "className": "flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 cursor-pointer" }, React.createElement(Plus, { "size": 11 }), React.createElement("span", null, "Add Nodal Force"))))
     );
   }
 
   if (selectedLoadId) {
     const load = model.loads.find((l) => l.id === selectedLoadId);
     if (!load) return null;
+
+    const parentNode =
+      load.kind === 'nodal' ? model.nodes.find((n) => n.id === load.nodeId) : undefined;
 
     const updateLoad = (patch                         ) => {
       onUpdateModel((prev) => ({
@@ -5749,34 +6046,37 @@ function ContextualPopup({
     };
 
     return (
-      React.createElement("div", { "id": "contextual-load-popup", "className": "absolute bottom-4 left-4 z-20 w-[370px] max-w-[calc(100vw-32px)] bg-slate-900/95 backdrop-blur-md border border-amber-500/50 rounded-xl shadow-2xl text-slate-100 p-3.5 select-none" }, React.createElement("div", { "className": "flex items-center justify-between pb-2 mb-2.5 border-b border-slate-800" }, React.createElement("div", null, React.createElement("span", { "className": "text-[10px] font-mono uppercase tracking-wider text-amber-400 block" }, "Load Parameter Editor"), React.createElement("h3", { "className": "text-sm font-bold text-slate-100" }, load.id, " · ", load.label || load.kind)), React.createElement("div", { "className": "flex items-center gap-1" }, React.createElement("button", { "type": "button", "onClick": onDeleteEntity, "title": "Delete Load", "className": "p-1.5 rounded-md text-rose-400 hover:bg-rose-500/20 cursor-pointer" }, React.createElement(Trash2, { "size": 14 })), React.createElement("button", { "type": "button", "onClick": onClose, "className": "p-1.5 rounded-md text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer" }, React.createElement(X, { "size": 15 })))), load.kind === 'member_distributed' || load.kind === 'member_point' ? (
-          React.createElement("div", { "className": "flex items-center gap-1.5 mb-2.5 bg-slate-950/70 p-1 rounded-lg border border-slate-800" }, React.createElement("button", { "type": "button", "onClick": () => convertMemberLoadKind('member_distributed'), "className": `flex-1 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${
+      React.createElement("div", { "id": "contextual-load-popup", "className": "absolute bottom-9 left-4 z-20 w-[390px] max-w-[calc(100vw-32px)] bg-white/95 backdrop-blur-md border border-slate-200 rounded-xl shadow-xl text-slate-900 p-3.5 select-none" }, React.createElement("div", { "className": "flex items-center justify-between pb-2 mb-2.5 border-b border-slate-200" }, React.createElement("div", null, React.createElement("span", { "className": "text-[10px] font-mono font-semibold uppercase tracking-wider text-amber-700 block" }, "Load Parameter Editor"), React.createElement("h3", { "className": "text-sm font-bold text-slate-900" }, load.id, " · ", load.label || load.kind)), React.createElement("div", { "className": "flex items-center gap-1" }, React.createElement("button", { "type": "button", "onClick": onDeleteEntity, "title": "Delete Load", "className": "p-1.5 rounded-md text-red-600 hover:bg-red-50 cursor-pointer" }, React.createElement(Trash2, { "size": 14 })), React.createElement("button", { "type": "button", "onClick": onClose, "className": "p-1.5 rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 cursor-pointer" }, React.createElement(X, { "size": 15 })))), parentNode ? (
+          React.createElement(NodeEntitySwitcher, { "node": parentNode, "model": model, "activeKind": "load", "activeId": load.id, "onSelectEntity": onSelectEntity, "onQuickAddNodalLoad": onQuickAddNodalLoad })
+        ) : null, load.kind === 'member_distributed' || load.kind === 'member_point' ? (
+          React.createElement("div", { "className": "flex items-center gap-1.5 mb-2.5 bg-slate-100 p-1 rounded-lg border border-slate-200" }, React.createElement("button", { "type": "button", "onClick": () => convertMemberLoadKind('member_distributed'), "className": `flex-1 py-1 rounded text-xs font-semibold cursor-pointer transition-colors ${
                 load.kind === 'member_distributed'
-                  ? 'bg-amber-500/25 text-amber-300 border border-amber-400/50'
-                  : 'text-slate-400 hover:text-slate-200'
-              }` }, "Distributed (w1, w2)"), React.createElement("button", { "type": "button", "onClick": () => convertMemberLoadKind('member_point'), "className": `flex-1 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${
+                  ? 'bg-amber-600 text-white shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white'
+              }` }, "Distributed (w1, w2)"), React.createElement("button", { "type": "button", "onClick": () => convertMemberLoadKind('member_point'), "className": `flex-1 py-1 rounded text-xs font-semibold cursor-pointer transition-colors ${
                 load.kind === 'member_point'
-                  ? 'bg-amber-500/25 text-amber-300 border border-amber-400/50'
-                  : 'text-slate-400 hover:text-slate-200'
+                  ? 'bg-amber-600 text-white shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white'
               }` }, "Point Load (P @ a)"))
         ) : null, load.kind === 'member_distributed' ? (
-          React.createElement("div", { "className": "space-y-2.5 mb-3" }, React.createElement("div", { "className": "grid grid-cols-2 gap-2" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Start w1 @ x=0 (kN/m)"), React.createElement("input", { "type": "number", "step": "2", "value": load.w1, "onChange": (e     ) => updateLoad({ w1: parseFloat(e.target.value) || 0 }), "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs text-amber-200" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "End w2 @ x=L (kN/m)"), React.createElement("input", { "type": "number", "step": "2", "value": load.w2, "onChange": (e     ) => updateLoad({ w2: parseFloat(e.target.value) || 0 }), "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs text-amber-200" }))), React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("label", { "className": "text-xs text-slate-300" }, "Coordinate Direction:"), React.createElement("select", { "value": load.direction, "onChange": (e     ) =>
+          React.createElement("div", { "className": "space-y-2.5 mb-3" }, React.createElement("div", { "className": "grid grid-cols-2 gap-2" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Start w1 @ x=0 (kN/m)"), React.createElement("input", { "type": "number", "step": "2", "value": load.w1, "onChange": (e     ) => updateLoad({ w1: parseFloat(e.target.value) || 0 }), "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "End w2 @ x=L (kN/m)"), React.createElement("input", { "type": "number", "step": "2", "value": load.w2, "onChange": (e     ) => updateLoad({ w2: parseFloat(e.target.value) || 0 }), "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" }))), React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("label", { "className": "text-xs font-medium text-slate-700" }, "Coordinate Direction:"), React.createElement("select", { "value": load.direction, "onChange": (e     ) =>
                   updateLoad({ direction: e.target.value                            })
-                , "className": "bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100" }, React.createElement("option", { "value": "local_perp" }, "Local Perpendicular (+y)"), React.createElement("option", { "value": "global_x" }, "Global X (Lateral)"), React.createElement("option", { "value": "global_y" }, "Global Y (Vertical)"))))
+                , "className": "bg-white border border-slate-300 rounded px-2 py-1 text-xs text-slate-900" }, React.createElement("option", { "value": "local_perp" }, "Local Perpendicular (+y)"), React.createElement("option", { "value": "global_x" }, "Global X (Lateral)"), React.createElement("option", { "value": "global_y" }, "Global Y (Vertical)"))))
         ) : null, load.kind === 'member_point' ? (
-          React.createElement("div", { "className": "space-y-2.5 mb-3" }, React.createElement("div", { "className": "grid grid-cols-2 gap-2" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Magnitude P (kN)"), React.createElement("input", { "type": "number", "step": "5", "value": load.p, "onChange": (e     ) => updateLoad({ p: parseFloat(e.target.value) || 0 }), "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs text-amber-200" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Position a from Start (m)"), React.createElement("input", { "type": "number", "step": "0.1", "min": "0", "value": load.a, "onChange": (e     ) =>
+          React.createElement("div", { "className": "space-y-2.5 mb-3" }, React.createElement("div", { "className": "grid grid-cols-2 gap-2" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Magnitude P (kN)"), React.createElement("input", { "type": "number", "step": "5", "value": load.p, "onChange": (e     ) => updateLoad({ p: parseFloat(e.target.value) || 0 }), "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Position a from Start (m)"), React.createElement("input", { "type": "number", "step": "0.1", "min": "0", "value": load.a, "onChange": (e     ) =>
                     updateLoad({ a: Math.max(0, parseFloat(e.target.value) || 0) })
-                  , "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs text-amber-200" }))), React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("label", { "className": "text-xs text-slate-300" }, "Coordinate Direction:"), React.createElement("select", { "value": load.direction, "onChange": (e     ) =>
+                  , "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" }))), React.createElement("div", { "className": "flex items-center justify-between gap-2" }, React.createElement("label", { "className": "text-xs font-medium text-slate-700" }, "Coordinate Direction:"), React.createElement("select", { "value": load.direction, "onChange": (e     ) =>
                   updateLoad({ direction: e.target.value                            })
-                , "className": "bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100" }, React.createElement("option", { "value": "local_perp" }, "Local Perpendicular (+y)"), React.createElement("option", { "value": "global_x" }, "Global X (Horizontal)"), React.createElement("option", { "value": "global_y" }, "Global Y (Vertical)"))))
+                , "className": "bg-white border border-slate-300 rounded px-2 py-1 text-xs text-slate-900" }, React.createElement("option", { "value": "local_perp" }, "Local Perpendicular (+y)"), React.createElement("option", { "value": "global_x" }, "Global X (Horizontal)"), React.createElement("option", { "value": "global_y" }, "Global Y (Vertical)"))))
         ) : null, load.kind === 'nodal' ? (
-          React.createElement("div", { "className": "grid grid-cols-3 gap-2 mb-3" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Fx (kN)"), React.createElement("input", { "type": "number", "step": "5", "value": load.fx, "onChange": (e     ) => updateLoad({ fx: parseFloat(e.target.value) || 0 }), "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs text-amber-200" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Fy (kN)"), React.createElement("input", { "type": "number", "step": "5", "value": load.fy, "onChange": (e     ) => updateLoad({ fy: parseFloat(e.target.value) || 0 }), "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs text-amber-200" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-400 block mb-0.5" }, "Moment Mz (kNm)"), React.createElement("input", { "type": "number", "step": "5", "value": load.mz, "onChange": (e     ) => updateLoad({ mz: parseFloat(e.target.value) || 0 }), "className": "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 font-mono text-xs text-amber-200" })))
-        ) : null, React.createElement("div", { "className": "flex items-center justify-between" }, React.createElement("button", { "type": "button", "onClick": () => onPinParameter('load_magnitude', load.id), "className": "flex items-center gap-1 px-2.5 py-1 rounded text-xs bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-400/40 cursor-pointer" }, React.createElement(Pin, { "size": 12 }), React.createElement("span", null, "Pin Load Magnitude to Live Sensitivity Slider"))))
+          React.createElement("div", { "className": "grid grid-cols-3 gap-2 mb-3" }, React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Fx (kN)"), React.createElement("input", { "type": "number", "step": "5", "value": load.fx, "onChange": (e     ) => updateLoad({ fx: parseFloat(e.target.value) || 0 }), "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Fy (kN)"), React.createElement("input", { "type": "number", "step": "5", "value": load.fy, "onChange": (e     ) => updateLoad({ fy: parseFloat(e.target.value) || 0 }), "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" })), React.createElement("div", null, React.createElement("label", { "className": "text-[10px] text-slate-500 block mb-0.5" }, "Moment Mz (kNm)"), React.createElement("input", { "type": "number", "step": "5", "value": load.mz, "onChange": (e     ) => updateLoad({ mz: parseFloat(e.target.value) || 0 }), "className": "w-full bg-white border border-slate-300 rounded px-2 py-1 font-mono text-xs text-slate-900" })))
+        ) : null, React.createElement("div", { "className": "flex items-center justify-between" }, React.createElement("button", { "type": "button", "onClick": () => onPinParameter('load_magnitude', load.id), "className": "flex items-center gap-1 px-2.5 py-1 rounded text-xs font-semibold bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 cursor-pointer" }, React.createElement(Pin, { "size": 12 }), React.createElement("span", null, "Pin Load Magnitude to Live Sensitivity Slider"))))
     );
   }
 
   return null;
 }
+
 
 
 
@@ -5795,7 +6095,7 @@ __modules.__mod_14 = (function() {
                  
                            
                                                                         
-const { Sliders, Gauge, RotateCcw, X, Plus, Pin, Activity } = __modules.__mod_10;
+const { Sliders, Gauge, RotateCcw, X, Pin, Activity } = __modules.__mod_10;
 
                                         
                          
@@ -5811,6 +6111,7 @@ const { Sliders, Gauge, RotateCcw, X, Plus, Pin, Activity } = __modules.__mod_10
                     
             
                                                                          
+                                                  
  
 
 function SensitivityPanel({
@@ -5824,25 +6125,33 @@ function SensitivityPanel({
   onResetPinnedParams,
   onAddQuickPin,
   onSelectEntity,
+  onCollapseChange,
 }                       ) {
   const [Collapsed, setCollapsed] = React.useState         (false);
   const [quickPinSelect, setQuickPinSelect] = React.useState        ('');
 
+  const toggleCollapse = (next         ) => {
+    setCollapsed(next);
+    if (onCollapseChange) {
+      setTimeout(() => onCollapseChange(next), 0);
+    }
+  };
+
   if (Collapsed) {
     return (
-      React.createElement("button", { "id": "btn-expand-sensitivity-panel", "type": "button", "onClick": () => setCollapsed(false), "className": "absolute top-3 right-3 z-20 flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/95 border border-sky-500/40 text-sky-300 text-xs font-semibold shadow-xl cursor-pointer hover:bg-slate-800" }, React.createElement(Sliders, { "size": 14 }), React.createElement("span", null, "Sensitivity & Telemetry"))
+      React.createElement("button", { "id": "btn-expand-sensitivity-panel", "type": "button", "onClick": () => toggleCollapse(false), "className": "absolute top-3 right-3 z-20 flex items-center gap-2 px-3 py-2 rounded-lg bg-white/95 border border-slate-300 text-blue-700 text-xs font-semibold shadow-lg cursor-pointer hover:bg-slate-50" }, React.createElement(Sliders, { "size": 14 }), React.createElement("span", null, "Sensitivity & Telemetry"))
     );
   }
 
   const maxEtaPct = Math.min(999, solverOutput.globalMaxUtilization * 100);
   const etaBarColor =
     solverOutput.globalMaxUtilization > 1.0
-      ? 'bg-rose-500'
+      ? 'bg-red-600'
       : solverOutput.globalMaxUtilization > 0.7
-        ? 'bg-amber-400'
-        : 'bg-emerald-400';
+        ? 'bg-amber-500'
+        : 'bg-emerald-600';
 
-  // Build available quick-pin options from active model
+  // Build available quick-pin options from active model (E, kx, ky, krz, and load magnitudes)
   const quickPinOptions                                          = [];
   for (const ld of model.loads) {
     quickPinOptions.push({
@@ -5853,16 +6162,18 @@ function SensitivityPanel({
   for (const el of model.elements) {
     if (el.kind === 'frame2d') {
       quickPinOptions.push({
-        value: `member_depth:${el.id}`,
-        label: `Member ${el.id} Depth h (${el.section.depthMm} mm)`,
-      });
-      quickPinOptions.push({
         value: `member_E:${el.id}`,
         label: `Member ${el.id} Modulus E (${el.material.E} GPa)`,
       });
     }
   }
   for (const n of model.nodes) {
+    if (n.springs.kx > 0) {
+      quickPinOptions.push({
+        value: `node_spring_kx:${n.id}`,
+        label: `Node ${n.id} Spring kx (${n.springs.kx} kN/m)`,
+      });
+    }
     if (n.springs.ky > 0) {
       quickPinOptions.push({
         value: `node_spring_ky:${n.id}`,
@@ -5887,13 +6198,10 @@ function SensitivityPanel({
   };
 
   const formatCurrentPinValue = (pin                       )         => {
-    if (pin.kind === 'member_depth') {
-      return `${Math.round(pin.baseValue * pin.multiplier)} mm`;
-    }
     if (pin.kind === 'member_E') {
       return `${(pin.baseValue * pin.multiplier).toFixed(1)} GPa`;
     }
-    if (pin.kind === 'node_spring_ky') {
+    if (pin.kind === 'node_spring_kx' || pin.kind === 'node_spring_ky') {
       return `${Math.round(pin.baseValue * pin.multiplier)} kN/m`;
     }
     if (pin.kind === 'node_spring_krz') {
@@ -5911,27 +6219,27 @@ function SensitivityPanel({
   };
 
   return (
-    React.createElement("aside", { "id": "realtime-sensitivity-panel", "className": "w-80 shrink-0 bg-slate-900/95 border-l border-slate-800 flex flex-col h-full overflow-y-auto select-none z-10 text-slate-100" }, React.createElement("div", { "className": "flex items-center justify-between px-3.5 py-2.5 border-b border-slate-800 bg-slate-950/50" }, React.createElement("div", { "className": "flex items-center gap-2" }, React.createElement(Sliders, { "size": 15, "className": "text-sky-400" }), React.createElement("h2", { "className": "text-xs font-bold uppercase tracking-wider text-slate-200" }, "Real-Time Sensitivity")), React.createElement("button", { "type": "button", "onClick": () => setCollapsed(true), "title": "Collapse Panel", "className": "p-1 rounded text-slate-400 hover:text-slate-100 hover:bg-slate-800 cursor-pointer" }, React.createElement(X, { "size": 14 }))), React.createElement("div", { "className": "p-3.5 border-b border-slate-800 space-y-3" }, React.createElement("div", null, React.createElement("div", { "className": "flex items-center justify-between text-xs mb-1" }, React.createElement("span", { "className": "text-slate-300 font-medium" }, "Deflection Scale"), React.createElement("span", { "className": "font-mono text-sky-300 font-semibold" }, layers.deflectionScale, "×")), React.createElement("input", { "id": "slider-deflection-scale", "type": "range", "min": "1", "max": "500", "step": "1", "value": layers.deflectionScale, "onChange": (e     ) =>
+    React.createElement("aside", { "id": "realtime-sensitivity-panel", "className": "w-80 shrink-0 bg-white border-l border-slate-200 flex flex-col h-full overflow-y-auto select-none z-10 text-slate-900 shadow-xs" }, React.createElement("div", { "className": "flex items-center justify-between px-3.5 py-2.5 border-b border-slate-200 bg-slate-50" }, React.createElement("div", { "className": "flex items-center gap-2" }, React.createElement(Sliders, { "size": 15, "className": "text-blue-600" }), React.createElement("h2", { "className": "text-xs font-bold uppercase tracking-wider text-slate-800" }, "Real-Time Sensitivity")), React.createElement("button", { "type": "button", "onClick": () => toggleCollapse(true), "title": "Collapse Panel", "className": "p-1 rounded text-slate-500 hover:text-slate-900 hover:bg-slate-200/70 cursor-pointer" }, React.createElement(X, { "size": 14 }))), React.createElement("div", { "className": "p-3.5 border-b border-slate-200 space-y-3" }, React.createElement("div", null, React.createElement("div", { "className": "flex items-center justify-between text-xs mb-1" }, React.createElement("span", { "className": "text-slate-700 font-medium" }, "Deflection Scale"), React.createElement("span", { "className": "font-mono text-blue-700 font-semibold" }, layers.deflectionScale, "×")), React.createElement("input", { "id": "slider-deflection-scale", "type": "range", "min": "1", "max": "500", "step": "1", "value": layers.deflectionScale, "onChange": (e     ) =>
               onUpdateLayers({ deflectionScale: Number(e.target.value) })
-            , "className": "w-full accent-sky-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg" }), React.createElement("div", { "className": "flex justify-between text-[10px] font-mono text-slate-500 mt-0.5" }, React.createElement("span", null, "1× (True)"), React.createElement("span", null, "250×"), React.createElement("span", null, "500×"))), React.createElement("div", null, React.createElement("div", { "className": "flex items-center justify-between text-xs mb-1" }, React.createElement("span", { "className": "text-slate-300 font-medium" }, "N / V / M Diagram Scale"), React.createElement("span", { "className": "font-mono text-rose-300 font-semibold" }, layers.diagramScale.toFixed(1), "×")), React.createElement("input", { "id": "slider-diagram-scale", "type": "range", "min": "0.2", "max": "3.0", "step": "0.1", "value": layers.diagramScale, "onChange": (e     ) =>
+            , "className": "w-full accent-blue-600 cursor-pointer h-1.5 bg-slate-200 rounded-lg" }), React.createElement("div", { "className": "flex justify-between text-[10px] font-mono text-slate-500 mt-0.5" }, React.createElement("span", null, "1× (True)"), React.createElement("span", null, "250×"), React.createElement("span", null, "500×"))), React.createElement("div", null, React.createElement("div", { "className": "flex items-center justify-between text-xs mb-1" }, React.createElement("span", { "className": "text-slate-700 font-medium" }, "N / V / M Diagram Scale"), React.createElement("span", { "className": "font-mono text-red-600 font-semibold" }, layers.diagramScale.toFixed(1), "×")), React.createElement("input", { "id": "slider-diagram-scale", "type": "range", "min": "0.2", "max": "3.0", "step": "0.1", "value": layers.diagramScale, "onChange": (e     ) =>
               onUpdateLayers({ diagramScale: Number(e.target.value) })
-            , "className": "w-full accent-rose-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg" }))), React.createElement("div", { "className": "p-3.5 border-b border-slate-800 space-y-2.5" }, React.createElement("div", { "className": "flex items-center justify-between" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement(Pin, { "size": 13, "className": "text-amber-400" }), React.createElement("span", { "className": "text-xs font-bold uppercase tracking-wider text-slate-300" }, "Parametric Sliders")), React.createElement("button", { "id": "btn-reset-sensitivity", "type": "button", "onClick": onResetPinnedParams, "title": "Reset all pinned multipliers to 1.0x", "className": "flex items-center gap-1 px-2 py-0.5 rounded text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 cursor-pointer" }, React.createElement(RotateCcw, { "size": 11 }), React.createElement("span", null, "1.0× Reset"))), React.createElement("p", { "className": "text-[11px] text-slate-400 leading-snug" }, "Drag any slider below to morph section stiffness, soil/joint springs, or loads at 60fps:"), React.createElement("div", { "className": "space-y-2.5 pt-1" }, pinnedParams.map((pin) => (
-            React.createElement("div", { "key": pin.id, "className": "bg-slate-950/80 border border-slate-800/90 rounded-lg p-2.5 space-y-1.5" }, React.createElement("div", { "className": "flex items-center justify-between gap-1" }, React.createElement("span", { "className": "text-xs font-semibold text-slate-200 truncate" }, pin.label), React.createElement("div", { "className": "flex items-center gap-1.5 shrink-0" }, React.createElement("span", { "className": "text-[11px] font-mono text-amber-300 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/30" }, pin.multiplier.toFixed(2), "× (", formatCurrentPinValue(pin), ")"), React.createElement("button", { "type": "button", "onClick": () => onUnpinParam(pin.id), "title": "Unpin parameter", "className": "text-slate-500 hover:text-rose-400 cursor-pointer" }, React.createElement(X, { "size": 13 })))), React.createElement("input", { "type": "range", "min": "0.1", "max": "3.0", "step": "0.05", "value": pin.multiplier, "onChange": (e     ) =>
+            , "className": "w-full accent-red-600 cursor-pointer h-1.5 bg-slate-200 rounded-lg" }))), React.createElement("div", { "className": "p-3.5 border-b border-slate-200 space-y-2.5" }, React.createElement("div", { "className": "flex items-center justify-between" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement(Pin, { "size": 13, "className": "text-amber-600" }), React.createElement("span", { "className": "text-xs font-bold uppercase tracking-wider text-slate-800" }, "Parametric Sliders")), React.createElement("button", { "id": "btn-reset-sensitivity", "type": "button", "onClick": onResetPinnedParams, "title": "Reset all pinned multipliers to 1.0x", "className": "flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 cursor-pointer" }, React.createElement(RotateCcw, { "size": 11 }), React.createElement("span", null, "1.0× Reset"))), React.createElement("p", { "className": "text-[11px] text-slate-600 leading-snug" }, "Drag any slider below to morph Young&apos;s modulus E, soil/joint springs, or loads at 60fps:"), React.createElement("div", { "className": "space-y-2.5 pt-1" }, pinnedParams.map((pin) => (
+            React.createElement("div", { "key": pin.id, "className": "bg-slate-50 border border-slate-200 rounded-lg p-2.5 space-y-1.5" }, React.createElement("div", { "className": "flex items-center justify-between gap-1" }, React.createElement("span", { "className": "text-xs font-semibold text-slate-800 truncate" }, pin.label), React.createElement("div", { "className": "flex items-center gap-1.5 shrink-0" }, React.createElement("span", { "className": "text-[11px] font-mono font-semibold text-amber-800 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-300" }, pin.multiplier.toFixed(2), "× (", formatCurrentPinValue(pin), ")"), React.createElement("button", { "type": "button", "onClick": () => onUnpinParam(pin.id), "title": "Unpin parameter", "className": "text-slate-400 hover:text-red-600 cursor-pointer" }, React.createElement(X, { "size": 13 })))), React.createElement("input", { "type": "range", "min": "0.1", "max": "3.0", "step": "0.05", "value": pin.multiplier, "onChange": (e     ) =>
                   onSlidePinnedParam(pin.id, parseFloat(e.target.value))
-                , "className": "w-full accent-amber-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg" }), React.createElement("div", { "className": "flex justify-between text-[10px] font-mono text-slate-500" }, React.createElement("span", null, "0.1×"), React.createElement("span", null, "1.0× Base"), React.createElement("span", null, "2.0×"), React.createElement("span", null, "3.0×")))
-          ))), React.createElement("div", { "className": "pt-1" }, React.createElement("select", { "id": "quick-pin-parameter-select", "value": quickPinSelect, "onChange": (e     ) => handleQuickPinAdd(e.target.value), "className": "w-full bg-slate-800/90 hover:bg-slate-800 text-xs text-slate-300 rounded-md px-2.5 py-1.5 border border-slate-700 cursor-pointer" }, React.createElement("option", { "value": "" }, "+ Pin another member / spring / load parameter..."), quickPinOptions.map((opt) => (
+                , "className": "w-full accent-amber-600 cursor-pointer h-1.5 bg-slate-200 rounded-lg" }), React.createElement("div", { "className": "flex justify-between text-[10px] font-mono text-slate-500" }, React.createElement("span", null, "0.1×"), React.createElement("span", null, "1.0× Base"), React.createElement("span", null, "2.0×"), React.createElement("span", null, "3.0×")))
+          ))), React.createElement("div", { "className": "pt-1" }, React.createElement("select", { "id": "quick-pin-parameter-select", "value": quickPinSelect, "onChange": (e     ) => handleQuickPinAdd(e.target.value), "className": "w-full bg-slate-50 hover:bg-slate-100 text-xs text-slate-700 rounded-md px-2.5 py-1.5 border border-slate-300 cursor-pointer" }, React.createElement("option", { "value": "" }, "+ Pin another modulus E / spring / load parameter..."), quickPinOptions.map((opt) => (
               React.createElement("option", { "key": opt.value, "value": opt.value }, opt.label)
-            ))))), React.createElement("div", { "className": "p-3.5 border-b border-slate-800 space-y-2.5" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement(Gauge, { "size": 14, "className": "text-emerald-400" }), React.createElement("span", { "className": "text-xs font-bold uppercase tracking-wider text-slate-300" }, "Peak Envelope Telemetry")), React.createElement("div", { "className": "bg-slate-950/80 border border-slate-800 rounded-lg p-2.5 space-y-1" }, React.createElement("div", { "className": "flex items-center justify-between text-xs" }, React.createElement("span", { "className": "text-slate-400" }, "Governing Utilization (σ_max / fy)"), React.createElement("span", { "className": `font-mono font-bold ${
+            ))))), React.createElement("div", { "className": "p-3.5 border-b border-slate-200 space-y-2.5" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement(Gauge, { "size": 14, "className": "text-emerald-600" }), React.createElement("span", { "className": "text-xs font-bold uppercase tracking-wider text-slate-800" }, "Peak Envelope Telemetry")), React.createElement("div", { "className": "bg-slate-50 border border-slate-200 rounded-lg p-2.5 space-y-1" }, React.createElement("div", { "className": "flex items-center justify-between text-xs" }, React.createElement("span", { "className": "text-slate-600 font-medium" }, "Governing Utilization (σ_max / fy)"), React.createElement("span", { "className": `font-mono font-bold ${
                 solverOutput.globalMaxUtilization > 1.0
-                  ? 'text-rose-400'
+                  ? 'text-red-600'
                   : solverOutput.globalMaxUtilization > 0.75
-                    ? 'text-amber-300'
-                    : 'text-emerald-300'
-              }` }, maxEtaPct.toFixed(1), "%")), React.createElement("div", { "className": "w-full h-2 bg-slate-800 rounded-full overflow-hidden" }, React.createElement("div", { "style": {
+                    ? 'text-amber-700'
+                    : 'text-emerald-700'
+              }` }, maxEtaPct.toFixed(1), "%")), React.createElement("div", { "className": "w-full h-2 bg-slate-200 rounded-full overflow-hidden" }, React.createElement("div", { "style": {
                 width: `${Math.min(100, Math.max(2, maxEtaPct))}%`,
               }, "className": `h-full transition-all ${etaBarColor}` })), solverOutput.governingMember.elementId ? (
-            React.createElement("div", { "className": "flex items-center justify-between text-[10px] font-mono text-slate-400 pt-0.5" }, React.createElement("span", null, "Critical: ", React.createElement("strong", { "className": "text-slate-200" }, solverOutput.governingMember.elementId), " @ x/L =", ' ', solverOutput.governingMember.xOverL.toFixed(2)), React.createElement("span", null, solverOutput.governingMember.sigmaMaxMpa.toFixed(1), " / ", solverOutput.governingMember.fyMpa, " MPa"))
-          ) : null), React.createElement("div", { "className": "grid grid-cols-2 gap-2 font-mono text-xs" }, React.createElement("div", { "className": "bg-slate-950/70 border border-slate-800/80 rounded-lg p-2" }, React.createElement("span", { "className": "text-[10px] font-sans text-slate-400 block" }, "Max Deflection |δ|"), React.createElement("span", { "className": "text-sky-300 font-bold" }, solverOutput.globalMaxDeflectionMm.toFixed(2), " mm")), React.createElement("div", { "className": "bg-slate-950/70 border border-slate-800/80 rounded-lg p-2" }, React.createElement("span", { "className": "text-[10px] font-sans text-slate-400 block" }, "Max Stress σ_max"), React.createElement("span", { "className": "text-amber-300 font-bold" }, solverOutput.globalMaxSigmaMpa.toFixed(1), " MPa")), React.createElement("div", { "className": "bg-slate-950/70 border border-slate-800/80 rounded-lg p-2" }, React.createElement("span", { "className": "text-[10px] font-sans text-slate-400 block" }, "Max Moment |M|"), React.createElement("span", { "className": "text-rose-300 font-bold" }, solverOutput.globalMaxM.toFixed(2), " kNm")), React.createElement("div", { "className": "bg-slate-950/70 border border-slate-800/80 rounded-lg p-2" }, React.createElement("span", { "className": "text-[10px] font-sans text-slate-400 block" }, "Max Shear |V| / Axial |N|"), React.createElement("span", { "className": "text-emerald-300 font-bold" }, solverOutput.globalMaxV.toFixed(1), " / ", solverOutput.globalMaxN.toFixed(1), " kN")))), React.createElement("div", { "className": "p-3.5 space-y-3 flex-1" }, React.createElement("div", { "className": "space-y-1.5" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement(Activity, { "size": 14, "className": "text-sky-400" }), React.createElement("span", { "className": "text-xs font-bold uppercase tracking-wider text-slate-300" }, "Member Envelope Extrema (x/L)")), React.createElement("div", { "className": "bg-slate-950/70 border border-slate-800 rounded-lg overflow-hidden" }, React.createElement("table", { "className": "w-full text-[10.5px] font-mono text-left" }, React.createElement("thead", { "className": "bg-slate-900 text-slate-400 border-b border-slate-800" }, React.createElement("tr", null, React.createElement("th", { "className": "py-1.5 px-2" }, "ID"), React.createElement("th", { "className": "py-1.5 px-1.5 text-right" }, "M_ext (x/L)"), React.createElement("th", { "className": "py-1.5 px-1.5 text-right" }, "V_ext"), React.createElement("th", { "className": "py-1.5 px-2 text-right" }, "σ/fy"))), React.createElement("tbody", { "className": "divide-y divide-slate-800/60" }, model.elements
+            React.createElement("div", { "className": "flex items-center justify-between text-[10px] font-mono text-slate-600 pt-0.5" }, React.createElement("span", null, "Critical: ", React.createElement("strong", { "className": "text-slate-900" }, solverOutput.governingMember.elementId), " @ x/L =", ' ', solverOutput.governingMember.xOverL.toFixed(2)), React.createElement("span", null, solverOutput.governingMember.sigmaMaxMpa.toFixed(1), " / ", solverOutput.governingMember.fyMpa, " MPa"))
+          ) : null), React.createElement("div", { "className": "grid grid-cols-2 gap-2 font-mono text-xs" }, React.createElement("div", { "className": "bg-slate-50 border border-slate-200 rounded-lg p-2" }, React.createElement("span", { "className": "text-[10px] font-sans text-slate-500 block" }, "Max Deflection |δ|"), React.createElement("span", { "className": "text-blue-700 font-bold" }, solverOutput.globalMaxDeflectionMm.toFixed(2), " mm")), React.createElement("div", { "className": "bg-slate-50 border border-slate-200 rounded-lg p-2" }, React.createElement("span", { "className": "text-[10px] font-sans text-slate-500 block" }, "Max Stress σ_max"), React.createElement("span", { "className": "text-amber-700 font-bold" }, solverOutput.globalMaxSigmaMpa.toFixed(1), " MPa")), React.createElement("div", { "className": "bg-slate-50 border border-slate-200 rounded-lg p-2" }, React.createElement("span", { "className": "text-[10px] font-sans text-slate-500 block" }, "Max Moment |M|"), React.createElement("span", { "className": "text-red-600 font-bold" }, solverOutput.globalMaxM.toFixed(2), " kNm")), React.createElement("div", { "className": "bg-slate-50 border border-slate-200 rounded-lg p-2" }, React.createElement("span", { "className": "text-[10px] font-sans text-slate-500 block" }, "Max Shear |V| / Axial |N|"), React.createElement("span", { "className": "text-emerald-700 font-bold" }, solverOutput.globalMaxV.toFixed(1), " / ", solverOutput.globalMaxN.toFixed(1), " kN")))), React.createElement("div", { "className": "p-3.5 space-y-3 flex-1" }, React.createElement("div", { "className": "space-y-1.5" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement(Activity, { "size": 14, "className": "text-blue-600" }), React.createElement("span", { "className": "text-xs font-bold uppercase tracking-wider text-slate-800" }, "Member Envelope Extrema (x/L)")), React.createElement("div", { "className": "bg-white border border-slate-200 rounded-lg overflow-hidden" }, React.createElement("table", { "className": "w-full text-[10.5px] font-mono text-left" }, React.createElement("thead", { "className": "bg-slate-100 text-slate-600 border-b border-slate-200" }, React.createElement("tr", null, React.createElement("th", { "className": "py-1.5 px-2" }, "ID"), React.createElement("th", { "className": "py-1.5 px-1.5 text-right" }, "M_ext (x/L)"), React.createElement("th", { "className": "py-1.5 px-1.5 text-right" }, "V_ext"), React.createElement("th", { "className": "py-1.5 px-2 text-right" }, "σ/fy"))), React.createElement("tbody", { "className": "divide-y divide-slate-200" }, model.elements
                   .filter((e)                      => e.kind === 'frame2d')
                   .map((el) => {
                     const er = solverOutput.elementResults[el.id];
@@ -5946,18 +6254,19 @@ function SensitivityPanel({
                         ? extrema.VMax
                         : extrema.VMin;
                     return (
-                      React.createElement("tr", { "key": el.id, "onClick": () => onSelectEntity('member', el.id), "className": "hover:bg-slate-800/60 cursor-pointer transition-colors" }, React.createElement("td", { "className": "py-1.5 px-2 font-bold text-sky-300" }, el.id), React.createElement("td", { "className": "py-1.5 px-1.5 text-right text-rose-300" }, govM.value.toFixed(1), ' ', React.createElement("span", { "className": "text-slate-500" }, "(", govM.xOverL.toFixed(2), ")")), React.createElement("td", { "className": "py-1.5 px-1.5 text-right text-emerald-300" }, govV.value.toFixed(1)), React.createElement("td", { "className": "py-1.5 px-2 text-right text-amber-300" }, (extrema.governingUtilization.value * 100).toFixed(0), "%"))
+                      React.createElement("tr", { "key": el.id, "onClick": () => onSelectEntity('member', el.id), "className": "hover:bg-blue-50/70 cursor-pointer transition-colors" }, React.createElement("td", { "className": "py-1.5 px-2 font-bold text-blue-700" }, el.id), React.createElement("td", { "className": "py-1.5 px-1.5 text-right text-red-600 font-medium" }, govM.value.toFixed(1), ' ', React.createElement("span", { "className": "text-slate-400" }, "(", govM.xOverL.toFixed(2), ")")), React.createElement("td", { "className": "py-1.5 px-1.5 text-right text-emerald-700 font-medium" }, govV.value.toFixed(1)), React.createElement("td", { "className": "py-1.5 px-2 text-right text-amber-700 font-semibold" }, (extrema.governingUtilization.value * 100).toFixed(0), "%"))
                     );
-                  }))))), React.createElement("div", { "className": "space-y-1.5" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement(Activity, { "size": 14, "className": "text-teal-400" }), React.createElement("span", { "className": "text-xs font-bold uppercase tracking-wider text-slate-300" }, "Support & Spring Reactions")), React.createElement("div", { "className": "bg-slate-950/70 border border-slate-800 rounded-lg overflow-hidden" }, React.createElement("table", { "className": "w-full text-[11px] font-mono text-left" }, React.createElement("thead", { "className": "bg-slate-900 text-slate-400 border-b border-slate-800" }, React.createElement("tr", null, React.createElement("th", { "className": "py-1.5 px-2" }, "Node"), React.createElement("th", { "className": "py-1.5 px-2 text-right" }, "Rx (kN)"), React.createElement("th", { "className": "py-1.5 px-2 text-right" }, "Ry (kN)"), React.createElement("th", { "className": "py-1.5 px-2 text-right" }, "Mz (kNm)"))), React.createElement("tbody", { "className": "divide-y divide-slate-800/60" }, model.nodes
+                  }))))), React.createElement("div", { "className": "space-y-1.5" }, React.createElement("div", { "className": "flex items-center gap-1.5" }, React.createElement(Activity, { "size": 14, "className": "text-teal-600" }), React.createElement("span", { "className": "text-xs font-bold uppercase tracking-wider text-slate-800" }, "Support & Spring Reactions")), React.createElement("div", { "className": "bg-white border border-slate-200 rounded-lg overflow-hidden" }, React.createElement("table", { "className": "w-full text-[11px] font-mono text-left" }, React.createElement("thead", { "className": "bg-slate-100 text-slate-600 border-b border-slate-200" }, React.createElement("tr", null, React.createElement("th", { "className": "py-1.5 px-2" }, "Node"), React.createElement("th", { "className": "py-1.5 px-2 text-right" }, "Rx (kN)"), React.createElement("th", { "className": "py-1.5 px-2 text-right" }, "Ry (kN)"), React.createElement("th", { "className": "py-1.5 px-2 text-right" }, "Mz (kNm)"))), React.createElement("tbody", { "className": "divide-y divide-slate-200" }, model.nodes
                   .filter((n) => solverOutput.nodeResults[n.id]?.hasReaction)
                   .map((n) => {
                     const nr = solverOutput.nodeResults[n.id];
                     return (
-                      React.createElement("tr", { "key": n.id, "onClick": () => onSelectEntity('node', n.id), "className": "hover:bg-slate-800/60 cursor-pointer transition-colors" }, React.createElement("td", { "className": "py-1.5 px-2 font-bold text-teal-300" }, n.id), React.createElement("td", { "className": "py-1.5 px-2 text-right" }, nr.reactionFx.toFixed(1)), React.createElement("td", { "className": "py-1.5 px-2 text-right" }, nr.reactionFy.toFixed(1)), React.createElement("td", { "className": "py-1.5 px-2 text-right" }, nr.reactionMz.toFixed(1)))
+                      React.createElement("tr", { "key": n.id, "onClick": () => onSelectEntity('node', n.id), "className": "hover:bg-teal-50/70 cursor-pointer transition-colors" }, React.createElement("td", { "className": "py-1.5 px-2 font-bold text-teal-700" }, n.id), React.createElement("td", { "className": "py-1.5 px-2 text-right text-slate-800" }, nr.reactionFx.toFixed(1)), React.createElement("td", { "className": "py-1.5 px-2 text-right text-slate-800" }, nr.reactionFy.toFixed(1)), React.createElement("td", { "className": "py-1.5 px-2 text-right text-slate-800" }, nr.reactionMz.toFixed(1)))
                     );
                   })))))))
   );
 }
+
 
 
 
@@ -5990,6 +6299,8 @@ const {
 } = __modules.__mod_5;
 const {
   hitTestCanvas,
+  hitTestAllCanvasEntities,
+  findNodeWithinRadius,
   probeMemberAtCursor,
   splitMemberAtPoint,
   canAddMember,
@@ -6014,7 +6325,7 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
     const l1 = model.loads.find((l) => l.id === 'L1');
     if (l1 && l1.kind === 'member_distributed') {
       pins.push({
-        id: 'pin_L1',
+        id: 'pin_load_magnitude_L1',
         label: 'Left Wall Earth+Water (L1)',
         kind: 'load_magnitude',
         loadId: 'L1',
@@ -6026,7 +6337,7 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
     const l3 = model.loads.find((l) => l.id === 'L3');
     if (l3 && l3.kind === 'member_distributed') {
       pins.push({
-        id: 'pin_L3',
+        id: 'pin_load_magnitude_L3',
         label: 'Roof Soil Surcharge (L3)',
         kind: 'load_magnitude',
         loadId: 'L3',
@@ -6038,18 +6349,18 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
     const m3 = model.elements.find((e)                      => e.id === 'M3' && e.kind === 'frame2d');
     if (m3) {
       pins.push({
-        id: 'pin_M3_h',
-        label: 'Roof Slab Depth h (M3)',
-        kind: 'member_depth',
+        id: 'pin_member_E_M3',
+        label: 'Roof Slab Modulus E (M3)',
+        kind: 'member_E',
         elementId: 'M3',
-        baseValue: m3.section.depthMm,
+        baseValue: m3.material.E,
         multiplier: 1.0,
       });
     }
     const n5 = model.nodes.find((n) => n.id === 'N5');
     if (n5) {
       pins.push({
-        id: 'pin_N5_ky',
+        id: 'pin_node_spring_ky_N5',
         label: 'Center Soil Spring ky (N5)',
         kind: 'node_spring_ky',
         nodeId: 'N5',
@@ -6064,7 +6375,7 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
     const l1 = model.loads.find((l) => l.id === 'L1');
     if (l1 && l1.kind === 'member_point') {
       pins.push({
-        id: 'pin_L1',
+        id: 'pin_load_magnitude_L1',
         label: 'Lateral Wind Load P (L1)',
         kind: 'load_magnitude',
         loadId: 'L1',
@@ -6075,7 +6386,7 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
     const l2 = model.loads.find((l) => l.id === 'L2');
     if (l2 && l2.kind === 'member_distributed') {
       pins.push({
-        id: 'pin_L2',
+        id: 'pin_load_magnitude_L2',
         label: 'Bay 1 Roof UDL (L2)',
         kind: 'load_magnitude',
         loadId: 'L2',
@@ -6087,11 +6398,11 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
     const m2 = model.elements.find((e)                      => e.id === 'M2' && e.kind === 'frame2d');
     if (m2) {
       pins.push({
-        id: 'pin_M2_h',
-        label: 'Center Column Depth h (M2)',
-        kind: 'member_depth',
+        id: 'pin_member_E_M2',
+        label: 'Center Column Modulus E (M2)',
+        kind: 'member_E',
         elementId: 'M2',
-        baseValue: m2.section.depthMm,
+        baseValue: m2.material.E,
         multiplier: 1.0,
       });
     }
@@ -6102,7 +6413,7 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
     const n2 = model.nodes.find((n) => n.id === 'N2');
     if (n2) {
       pins.push({
-        id: 'pin_N2_krz',
+        id: 'pin_node_spring_krz_N2',
         label: 'Center Pier Spring kθ (N2)',
         kind: 'node_spring_krz',
         nodeId: 'N2',
@@ -6113,7 +6424,7 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
     const l1 = model.loads.find((l) => l.id === 'L1');
     if (l1 && l1.kind === 'member_distributed') {
       pins.push({
-        id: 'pin_L1',
+        id: 'pin_load_magnitude_L1',
         label: 'Span 1 UDL w (L1)',
         kind: 'load_magnitude',
         loadId: 'L1',
@@ -6125,7 +6436,7 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
     const l2 = model.loads.find((l) => l.id === 'L2');
     if (l2 && l2.kind === 'member_point') {
       pins.push({
-        id: 'pin_L2',
+        id: 'pin_load_magnitude_L2',
         label: 'Span 2 Point Load P (L2)',
         kind: 'load_magnitude',
         loadId: 'L2',
@@ -6140,7 +6451,7 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
   const l2 = model.loads.find((l) => l.id === 'L2');
   if (l2 && l2.kind === 'nodal') {
     pins.push({
-      id: 'pin_L2',
+      id: 'pin_load_magnitude_L2',
       label: 'Center Joint Load Fy (L2)',
       kind: 'load_magnitude',
       loadId: 'L2',
@@ -6151,7 +6462,7 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
   const m6 = model.elements.find((e)                      => e.id === 'M6' && e.kind === 'frame2d');
   if (m6) {
     pins.push({
-      id: 'pin_M6_E',
+      id: 'pin_member_E_M6',
       label: 'Top Chord Modulus E (M6)',
       kind: 'member_E',
       elementId: 'M6',
@@ -6163,6 +6474,13 @@ function buildDefaultPinsForPreset(presetId        , model                 )    
 }
 
 const rendererInstance = new CanvasRenderer();
+
+                        
+            
+            
+                  
+                          
+  
 
 function App() {
   const initialPreset = BENCHMARK_PRESETS[0];
@@ -6209,18 +6527,39 @@ function App() {
   });
 
   const [snapTarget, setSnapTarget] = React.useState                   (null);
-  const [drawStartPoint, setDrawStartPoint] = React.useState  
-              
-              
-                    
-                            
-           (null);
+  const [drawStartPoint, setDrawStartPointState] = React.useState                        (null);
   const [hoverProbe, setHoverProbe] = React.useState                       (null);
   const [toastMessage, setToastMessage] = React.useState               (null);
 
   const canvasRef = React.useRef                          (null);
   const containerRef = React.useRef                       (null);
   const loadHandlesRef = React.useRef                    ([]);
+
+  // Synchronized mutable refs to prevent stale React state closures in pointer/mouse event handlers
+  const modelRef = React.useRef                 (model);
+  modelRef.current = model;
+  const viewportRef = React.useRef                   (viewport);
+  viewportRef.current = viewport;
+  const activeToolRef = React.useRef                (activeTool);
+  activeToolRef.current = activeTool;
+  const drawStartPointRef = React.useRef                        (drawStartPoint);
+
+  const setDrawStartPoint = (pt                        ) => {
+    drawStartPointRef.current = pt;
+    setDrawStartPointState(pt);
+  };
+
+  // Track click-through selection cycling at busy nodes (within 8 px of previous click)
+  const lastSelectClickRef = React.useRef  
+               
+               
+                       
+    ({
+    sx: -9999,
+    sy: -9999,
+    cycleIndex: 0,
+  });
+
   const panDragRef = React.useRef  
                     
                     
@@ -6251,21 +6590,22 @@ function App() {
     updater                                            ,
     recordUndo          = true
   ) => {
-    setModel((prev) => {
-      const next = updater(structuredClone(prev));
-      if (recordUndo) {
-        setUndoStack((u) => [...u.slice(-29), prev]);
-        setRedoStack([]);
-      }
-      return next;
-    });
+    const prev = modelRef.current;
+    const next = updater(structuredClone(prev));
+    modelRef.current = next;
+    if (recordUndo) {
+      setUndoStack((u) => [...u.slice(-29), prev]);
+      setRedoStack([]);
+    }
+    setModel(next);
   };
 
   const handleUndo = () => {
     if (undoStack.length === 0) return;
     const prevModel = undoStack[undoStack.length - 1];
     setUndoStack((u) => u.slice(0, -1));
-    setRedoStack((r) => [...r, model]);
+    setRedoStack((r) => [...r, modelRef.current]);
+    modelRef.current = prevModel;
     setModel(prevModel);
   };
 
@@ -6273,8 +6613,34 @@ function App() {
     if (redoStack.length === 0) return;
     const nextModel = redoStack[redoStack.length - 1];
     setRedoStack((r) => r.slice(0, -1));
-    setUndoStack((u) => [...u, model]);
+    setUndoStack((u) => [...u, modelRef.current]);
+    modelRef.current = nextModel;
     setModel(nextModel);
+  };
+
+  // Fit structure to usable canvas area (excluding top toolbar height & open right-hand Sensitivity Panel width)
+  const fitNodesToUsableCanvas = (nodesToFit                  ) => {
+    const el = containerRef.current;
+    const rect = el ? el.getBoundingClientRect() : null;
+    const usableW = rect && rect.width > 0 ? rect.width : viewportRef.current.width;
+    const usableH = rect && rect.height > 0 ? rect.height : viewportRef.current.height;
+    setViewport((vp) => fitModelToViewport(nodesToFit, usableW, usableH, vp));
+  };
+
+  const handleSelectEntity = (kind                            , id        ) => {
+    if (kind === 'node') {
+      setSelectedNodeId(id);
+      setSelectedElementId(null);
+      setSelectedLoadId(null);
+    } else if (kind === 'member') {
+      setSelectedElementId(id);
+      setSelectedNodeId(null);
+      setSelectedLoadId(null);
+    } else {
+      setSelectedLoadId(id);
+      setSelectedNodeId(null);
+      setSelectedElementId(null);
+    }
   };
 
   const handleSelectPreset = (presetId        ) => {
@@ -6284,6 +6650,7 @@ function App() {
     setActivePresetId(presetId);
     setUndoStack([]);
     setRedoStack([]);
+    modelRef.current = freshModel;
     setModel(freshModel);
     setSelectedNodeId(null);
     setSelectedElementId(freshModel.elements[0]?.id ?? null);
@@ -6312,7 +6679,29 @@ function App() {
       }));
     }
 
-    setViewport((vp) => fitModelToViewport(freshModel.nodes, vp.width, vp.height, vp));
+    fitNodesToUsableCanvas(freshModel.nodes);
+  };
+
+  // New Blank Project button handler: clears all nodes, members, loads, and sensitivity pins
+  // into an empty 0.1 m Cartesian workspace while pushing previous state onto Undo stack
+  const handleNewBlankProject = () => {
+    const blankModel                  = {
+      name: 'Blank Project',
+      dimension: '2d',
+      nodes: [],
+      elements: [],
+      loads: [],
+    };
+    updateModelWithHistory(() => blankModel, true);
+    setPinnedParams([]);
+    setSelectedNodeId(null);
+    setSelectedElementId(null);
+    setSelectedLoadId(null);
+    setDrawStartPoint(null);
+    setHoverProbe(null);
+    setViewport((vp) => ({ ...vp, coordSystem: 'cartesian' }));
+    fitNodesToUsableCanvas([]);
+    showToast('Cleared workspace to new 0.1 m Cartesian project (Ctrl+Z to undo).');
   };
 
   // Fit viewport on mount and container resize
@@ -6323,7 +6712,7 @@ function App() {
       const rect = el.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
         setViewport((vp) =>
-          fitModelToViewport(model.nodes, rect.width, rect.height, vp)
+          fitModelToViewport(modelRef.current.nodes, rect.width, rect.height, vp)
         );
       }
     };
@@ -6479,27 +6868,61 @@ function App() {
     workingModel                 ,
     snap            
   )                                             => {
+    // 1. Reuse existing node if snap.nodeId is present and valid
     if (snap.kind === 'node' && snap.nodeId) {
-      return { model: workingModel, nodeId: snap.nodeId };
+      const exists = workingModel.nodes.find((n) => n.id === snap.nodeId);
+      if (exists) {
+        return { model: workingModel, nodeId: exists.id };
+      }
     }
-    if (snap.kind === 'member_segment' && snap.splitElementId) {
-      // Auto-split existing member at T-junction!
-      const splitRes = splitMemberAtPoint(
-        workingModel,
-        snap.splitElementId,
-        snap.x,
-        snap.y
-      );
-      showToast(`Auto-split member ${snap.splitElementId} at T-junction (${snap.x}m, ${snap.y}m)`);
-      return { model: splitRes.model, nodeId: splitRes.newNodeId };
-    }
-    // Check if a node already exists at (snap.x, snap.y)
-    const existing = workingModel.nodes.find(
+
+    // 2. Check if any existing node is already at (snap.x, snap.y)
+    const existingAtCoord = workingModel.nodes.find(
       (n) => Math.hypot(n.x - snap.x, n.y - snap.y) < 0.04
     );
-    if (existing) {
-      return { model: workingModel, nodeId: existing.id };
+    if (existingAtCoord) {
+      return { model: workingModel, nodeId: existingAtCoord.id };
     }
+
+    // 3. Auto-split existing member at mid-span intersection
+    if (snap.kind === 'member_segment' && snap.splitElementId) {
+      let targetElId                     = snap.splitElementId;
+      if (!workingModel.elements.some((e) => e.id === targetElId)) {
+        // If the start point already split this member, find which sub-member contains (snap.x, snap.y)
+        const nodeMap = new Map(workingModel.nodes.map((n) => [n.id, n]));
+        for (const el of workingModel.elements) {
+          if (el.kind !== 'frame2d') continue;
+          const ni = nodeMap.get(el.nodeI);
+          const nj = nodeMap.get(el.nodeJ);
+          if (!ni || !nj) continue;
+          const dx = nj.x - ni.x;
+          const dy = nj.y - ni.y;
+          const lenSq = dx * dx + dy * dy;
+          if (lenSq < 1e-9) continue;
+          const t = ((snap.x - ni.x) * dx + (snap.y - ni.y) * dy) / lenSq;
+          if (t > 0.02 && t < 0.98) {
+            const projX = ni.x + t * dx;
+            const projY = ni.y + t * dy;
+            if (Math.hypot(snap.x - projX, snap.y - projY) < 0.05) {
+              targetElId = el.id;
+              break;
+            }
+          }
+        }
+      }
+      if (targetElId && workingModel.elements.some((e) => e.id === targetElId)) {
+        const splitRes = splitMemberAtPoint(
+          workingModel,
+          targetElId,
+          snap.x,
+          snap.y
+        );
+        showToast(`Split member ${targetElId} at node ${splitRes.newNodeId} (${snap.x}m, ${snap.y}m)`);
+        return { model: splitRes.model, nodeId: splitRes.newNodeId };
+      }
+    }
+
+    // 4. Create and append a new StructuralNode (z = 0) at the 0.1 m grid coordinate
     const newNodeId = nextEntityId(
       'N',
       workingModel.nodes.map((n) => n.id)
@@ -6522,12 +6945,14 @@ function App() {
 
   // Complete drawing a member from startSnap to endSnap
   const completeDrawMember = (
-    startSnap                                                                    ,
+    startSnap                 ,
     endSnap            
   ) => {
     if (Math.hypot(endSnap.x - startSnap.x, endSnap.y - startSnap.y) < 0.05) {
       return;
     }
+
+    let createdElementId                = null;
 
     updateModelWithHistory((prev) => {
       let working = prev;
@@ -6546,7 +6971,6 @@ function App() {
       });
       working = startRes.model;
 
-      // Re-verify endSnap in case startSnap split the same element
       const endRes = resolveSnapPointToNode(working, endSnap);
       working = endRes.model;
 
@@ -6580,24 +7004,31 @@ function App() {
         releaseEnd: false,
       };
 
-      setSelectedNodeId(null);
-      setSelectedLoadId(null);
-      setSelectedElementId(newElId);
+      createdElementId = newElId;
 
       return {
         ...working,
         elements: [...working.elements, newEl],
       };
     });
+
+    if (createdElementId) {
+      setSelectedNodeId(null);
+      setSelectedLoadId(null);
+      setSelectedElementId(createdElementId);
+    }
   };
 
-  // Canvas Mouse Handlers
+  // Canvas Mouse / Pointer Handlers
   const handleCanvasMouseDown = (e     ) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
+    const currentVp = viewportRef.current;
+    const currentModel = modelRef.current;
+    const currentTool = activeToolRef.current;
 
     // Middle mouse button or right mouse button -> pan
     if (e.button === 1 || e.button === 2) {
@@ -6606,18 +7037,27 @@ function App() {
         active: true,
         startSx: sx,
         startSy: sy,
-        origPanX: viewport.panX,
-        origPanY: viewport.panY,
+        origPanX: currentVp.panX,
+        origPanY: currentVp.panY,
         moved: false,
       };
       return;
     }
 
-    const currentSnap = computeSmartSnap(sx, sy, viewport, model.nodes, model.elements);
+    const currentSnap = computeSmartSnap(
+      sx,
+      sy,
+      currentVp,
+      currentModel.nodes,
+      currentModel.elements
+    );
     setSnapTarget(currentSnap);
 
-    if (activeTool === 'draw_member') {
-      if (!drawStartPoint) {
+    // 1. Draw Member Tool: supports both Two-Click (click start -> move -> click end)
+    // and Click-and-Drag (mousedown start -> drag -> mouseup end)
+    if (currentTool === 'draw_member') {
+      const activeStart = drawStartPointRef.current;
+      if (!activeStart) {
         setDrawStartPoint({
           x: currentSnap.x,
           y: currentSnap.y,
@@ -6625,63 +7065,75 @@ function App() {
           splitElementId: currentSnap.splitElementId,
         });
       } else {
-        completeDrawMember(drawStartPoint, currentSnap);
+        completeDrawMember(activeStart, currentSnap);
         setDrawStartPoint(null);
       }
       return;
     }
 
-    const hit = hitTestCanvas(sx, sy, viewport, model, loadHandlesRef.current);
-
-    if (activeTool === 'delete') {
-      if (hit) {
-        handleDeleteEntityById(hit.kind, hit.kind === 'node' ? hit.nodeId : hit.kind === 'member' ? hit.elementId : hit.loadId);
-      }
-      return;
-    }
-
-    if (activeTool === 'assign_support') {
-      if (hit && hit.kind === 'node') {
-        // Cycle support preset or select node to open support inspector
+    // 2. Assign Support Tool: generous 16 px screen-space node hit radius via worldToScreen
+    if (currentTool === 'assign_support') {
+      const nodeHit = findNodeWithinRadius(sx, sy, currentVp, currentModel.nodes, 16);
+      if (nodeHit) {
+        const targetNodeId = nodeHit.node.id;
+        const order                              = [
+          'pinned',
+          'fixed',
+          'rollerX',
+          'rollerY',
+          'none',
+        ];
+        let assignedSupport                            = 'pinned';
         updateModelWithHistory((prev) => ({
           ...prev,
           nodes: prev.nodes.map((n) => {
-            if (n.id !== hit.nodeId) return n;
-            const order                              = [
-              'pinned',
-              'rollerX',
-              'fixed',
-              'inclinedRoller',
-              'none',
-            ];
-            const nextSup = order[(order.indexOf(n.support) + 1) % order.length];
+            if (n.id !== targetNodeId) return n;
+            const curIdx = order.indexOf(n.support);
+            const nextSup = order[(curIdx + 1) % order.length];
+            assignedSupport = nextSup;
             return {
               ...n,
               support: nextSup,
-              inclinedAngleDeg: nextSup === 'inclinedRoller' ? 30 : n.inclinedAngleDeg,
               restraints: restraintsFromSupportPreset(nextSup),
             };
           }),
         }));
-        setSelectedNodeId(hit.nodeId);
+        setSelectedNodeId(targetNodeId);
         setSelectedElementId(null);
         setSelectedLoadId(null);
+        showToast(`Node ${targetNodeId} support → ${assignedSupport}`);
       } else {
-        showToast('Click any node to assign or cycle its support restraint.');
+        showToast('Click within 16 px of any node to assign or cycle its support restraint.');
       }
       return;
     }
 
-    if (activeTool === 'add_nodal_load') {
-      if (hit && hit.kind === 'node') {
-        handleQuickAddNodalLoad(hit.nodeId);
+    // 3. Add Nodal Load Tool: generous 16 px screen-space node hit radius
+    if (currentTool === 'add_nodal_load') {
+      const nodeHit = findNodeWithinRadius(sx, sy, currentVp, currentModel.nodes, 16);
+      if (nodeHit) {
+        handleQuickAddNodalLoad(nodeHit.node.id);
       } else {
         showToast('Click any node to apply a concentrated Nodal Load (Fx, Fy, Mz).');
       }
       return;
     }
 
-    if (activeTool === 'add_member_load') {
+    const hit = hitTestCanvas(sx, sy, currentVp, currentModel, loadHandlesRef.current);
+
+    // 4. Delete Tool
+    if (currentTool === 'delete') {
+      if (hit) {
+        handleDeleteEntityById(
+          hit.kind,
+          hit.kind === 'node' ? hit.nodeId : hit.kind === 'member' ? hit.elementId : hit.loadId
+        );
+      }
+      return;
+    }
+
+    // 5. Add Member Load Tool
+    if (currentTool === 'add_member_load') {
       if (hit && hit.kind === 'member') {
         handleQuickAddMemberLoad(hit.elementId, 'distributed');
       } else {
@@ -6690,28 +7142,44 @@ function App() {
       return;
     }
 
-    // Default 'select' mode: if clicked on background, start pan drag; if clicked on entity, open contextual pop-up
-    if (hit) {
-      if (hit.kind === 'node') {
-        setSelectedNodeId(hit.nodeId);
-        setSelectedElementId(null);
-        setSelectedLoadId(null);
-      } else if (hit.kind === 'member') {
-        setSelectedElementId(hit.elementId);
-        setSelectedNodeId(null);
-        setSelectedLoadId(null);
-      } else if (hit.kind === 'load') {
-        setSelectedLoadId(hit.loadId);
-        setSelectedNodeId(null);
-        setSelectedElementId(null);
+    // 6. Select / Inspect Tool: support Click-Through Cycling within 8 px over busy nodes!
+    // Cycle order: Node -> Nodal Load #1 -> Nodal Load #2 (etc.) -> Connected Member(s) -> back to Node
+    const allHits = hitTestAllCanvasEntities(
+      sx,
+      sy,
+      currentVp,
+      currentModel,
+      loadHandlesRef.current
+    );
+
+    if (allHits.length > 0) {
+      const prevClick = lastSelectClickRef.current;
+      const distFromLastClick = Math.hypot(sx - prevClick.sx, sy - prevClick.sy);
+      const nextCycleIdx =
+        distFromLastClick <= 8 ? (prevClick.cycleIndex + 1) % allHits.length : 0;
+
+      lastSelectClickRef.current = {
+        sx,
+        sy,
+        cycleIndex: nextCycleIdx,
+      };
+
+      const chosen = allHits[nextCycleIdx];
+      if (chosen.kind === 'node') {
+        handleSelectEntity('node', chosen.nodeId);
+      } else if (chosen.kind === 'load') {
+        handleSelectEntity('load', chosen.loadId);
+      } else if (chosen.kind === 'member') {
+        handleSelectEntity('member', chosen.elementId);
       }
     } else {
+      lastSelectClickRef.current = { sx: -9999, sy: -9999, cycleIndex: 0 };
       panDragRef.current = {
         active: true,
         startSx: sx,
         startSy: sy,
-        origPanX: viewport.panX,
-        origPanY: viewport.panY,
+        origPanX: currentVp.panX,
+        origPanY: currentVp.panY,
         moved: false,
       };
     }
@@ -6723,6 +7191,8 @@ function App() {
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
+    const currentVp = viewportRef.current;
+    const currentModel = modelRef.current;
 
     if (panDragRef.current.active) {
       const dx = sx - panDragRef.current.startSx;
@@ -6738,11 +7208,17 @@ function App() {
       return;
     }
 
-    const currentSnap = computeSmartSnap(sx, sy, viewport, model.nodes, model.elements);
+    const currentSnap = computeSmartSnap(
+      sx,
+      sy,
+      currentVp,
+      currentModel.nodes,
+      currentModel.elements
+    );
     setSnapTarget(currentSnap);
 
     // Interactive Hover Probe along any member
-    const probe = probeMemberAtCursor(sx, sy, viewport, model, solverOutput, 18);
+    const probe = probeMemberAtCursor(sx, sy, currentVp, currentModel, solverOutput, 18);
     setHoverProbe(probe);
     setHoveredElementId(probe ? probe.element.id : null);
   };
@@ -6753,11 +7229,14 @@ function App() {
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
+    const currentVp = viewportRef.current;
+    const currentModel = modelRef.current;
+    const currentTool = activeToolRef.current;
 
     if (panDragRef.current.active) {
       const wasMoved = panDragRef.current.moved;
       panDragRef.current.active = false;
-      if (!wasMoved && activeTool === 'select') {
+      if (!wasMoved && currentTool === 'select') {
         setSelectedNodeId(null);
         setSelectedElementId(null);
         setSelectedLoadId(null);
@@ -6765,11 +7244,18 @@ function App() {
       return;
     }
 
-    // Support click-drag-release in Draw Member mode!
-    if (activeTool === 'draw_member' && drawStartPoint) {
-      const currentSnap = computeSmartSnap(sx, sy, viewport, model.nodes, model.elements);
-      if (Math.hypot(currentSnap.x - drawStartPoint.x, currentSnap.y - drawStartPoint.y) >= 0.2) {
-        completeDrawMember(drawStartPoint, currentSnap);
+    // Support click-and-drag release in Draw Member mode (when dragged >= 0.1 m away from start)
+    const activeStart = drawStartPointRef.current;
+    if (currentTool === 'draw_member' && activeStart) {
+      const currentSnap = computeSmartSnap(
+        sx,
+        sy,
+        currentVp,
+        currentModel.nodes,
+        currentModel.elements
+      );
+      if (Math.hypot(currentSnap.x - activeStart.x, currentSnap.y - activeStart.y) >= 0.09) {
+        completeDrawMember(activeStart, currentSnap);
         setDrawStartPoint(null);
       }
     }
@@ -6802,9 +7288,10 @@ function App() {
     elementId        ,
     loadType                         
   ) => {
+    const currentModel = modelRef.current;
     const newLoadId = nextEntityId(
       'L',
-      model.loads.map((l) => l.id)
+      currentModel.loads.map((l) => l.id)
     );
     const newLoad                 =
       loadType === 'distributed'
@@ -6831,15 +7318,14 @@ function App() {
       ...prev,
       loads: [...prev.loads, newLoad],
     }));
-    setSelectedLoadId(newLoadId);
-    setSelectedElementId(null);
-    setSelectedNodeId(null);
+    handleSelectEntity('load', newLoadId);
   };
 
   const handleQuickAddNodalLoad = (nodeId        ) => {
+    const currentModel = modelRef.current;
     const newLoadId = nextEntityId(
       'L',
-      model.loads.map((l) => l.id)
+      currentModel.loads.map((l) => l.id)
     );
     const newLoad                 = {
       id: newLoadId,
@@ -6854,12 +7340,10 @@ function App() {
       ...prev,
       loads: [...prev.loads, newLoad],
     }));
-    setSelectedLoadId(newLoadId);
-    setSelectedNodeId(null);
-    setSelectedElementId(null);
+    handleSelectEntity('load', newLoadId);
   };
 
-  // Pin a parameter to the Real-Time Sensitivity Panel
+  // Pin a parameter to the Real-Time Sensitivity Panel (E, kx, ky, kθ, or Load magnitude)
   const handlePinParameter = (
     kind                               ,
     targetId        
@@ -6870,24 +7354,10 @@ function App() {
       return;
     }
 
-    if (kind === 'member_depth') {
-      const el = model.elements.find(
-        (e)                      => e.kind === 'frame2d' && e.id === targetId
-      );
-      if (!el) return;
-      setPinnedParams((prev) => [
-        ...prev,
-        {
-          id: pinId,
-          label: `Member ${el.id} Depth h`,
-          kind: 'member_depth',
-          elementId: el.id,
-          baseValue: el.section.depthMm,
-          multiplier: 1.0,
-        },
-      ]);
-    } else if (kind === 'member_E') {
-      const el = model.elements.find(
+    const currentModel = modelRef.current;
+
+    if (kind === 'member_E') {
+      const el = currentModel.elements.find(
         (e)                      => e.kind === 'frame2d' && e.id === targetId
       );
       if (!el) return;
@@ -6902,8 +7372,31 @@ function App() {
           multiplier: 1.0,
         },
       ]);
+    } else if (kind === 'node_spring_kx') {
+      const n = currentModel.nodes.find((item) => item.id === targetId);
+      if (!n) return;
+      const baseKx = n.springs.kx > 0 ? n.springs.kx : 25000;
+      if (n.springs.kx === 0) {
+        updateModelWithHistory((prev) => ({
+          ...prev,
+          nodes: prev.nodes.map((nd) =>
+            nd.id === n.id ? { ...nd, springs: { ...nd.springs, kx: baseKx } } : nd
+          ),
+        }));
+      }
+      setPinnedParams((prev) => [
+        ...prev,
+        {
+          id: pinId,
+          label: `Node ${n.id} Spring kx`,
+          kind: 'node_spring_kx',
+          nodeId: n.id,
+          baseValue: baseKx,
+          multiplier: 1.0,
+        },
+      ]);
     } else if (kind === 'node_spring_ky') {
-      const n = model.nodes.find((item) => item.id === targetId);
+      const n = currentModel.nodes.find((item) => item.id === targetId);
       if (!n) return;
       const baseKy = n.springs.ky > 0 ? n.springs.ky : 25000;
       if (n.springs.ky === 0) {
@@ -6926,7 +7419,7 @@ function App() {
         },
       ]);
     } else if (kind === 'node_spring_krz') {
-      const n = model.nodes.find((item) => item.id === targetId);
+      const n = currentModel.nodes.find((item) => item.id === targetId);
       if (!n) return;
       const baseKrz = n.springs.krz > 0 ? n.springs.krz : 15000;
       if (n.springs.krz === 0) {
@@ -6949,7 +7442,7 @@ function App() {
         },
       ]);
     } else if (kind === 'load_magnitude') {
-      const ld = model.loads.find((l) => l.id === targetId);
+      const ld = currentModel.loads.find((l) => l.id === targetId);
       if (!ld) return;
       const basePrimary =
         ld.kind === 'member_distributed'
@@ -6988,25 +7481,10 @@ function App() {
     );
 
     setModel((prev) => {
-      if (targetPin.kind === 'member_depth') {
-        const nextDepth = Math.max(20, Math.round(targetPin.baseValue * multiplier));
-        return {
-          ...prev,
-          elements: prev.elements.map((el) => {
-            if (el.id !== targetPin.elementId || el.kind !== 'frame2d') return el;
-            const dimKey = el.section.shape === 'circular' ? 'd' : 'h';
-            const nextDims = { ...el.section.dimensions, [dimKey]: nextDepth };
-            return {
-              ...el,
-              section: computeCrossSection(el.section.shape, nextDims),
-            };
-          }),
-        };
-      }
-
+      let next = prev;
       if (targetPin.kind === 'member_E') {
         const nextE = Number(Math.max(1, targetPin.baseValue * multiplier).toFixed(1));
-        return {
+        next = {
           ...prev,
           elements: prev.elements.map((el) =>
             el.id === targetPin.elementId && el.kind === 'frame2d'
@@ -7014,11 +7492,19 @@ function App() {
               : el
           ),
         };
-      }
-
-      if (targetPin.kind === 'node_spring_ky') {
+      } else if (targetPin.kind === 'node_spring_kx') {
+        const nextKx = Math.round(targetPin.baseValue * multiplier);
+        next = {
+          ...prev,
+          nodes: prev.nodes.map((n) =>
+            n.id === targetPin.nodeId
+              ? { ...n, springs: { ...n.springs, kx: nextKx } }
+              : n
+          ),
+        };
+      } else if (targetPin.kind === 'node_spring_ky') {
         const nextKy = Math.round(targetPin.baseValue * multiplier);
-        return {
+        next = {
           ...prev,
           nodes: prev.nodes.map((n) =>
             n.id === targetPin.nodeId
@@ -7026,11 +7512,9 @@ function App() {
               : n
           ),
         };
-      }
-
-      if (targetPin.kind === 'node_spring_krz') {
+      } else if (targetPin.kind === 'node_spring_krz') {
         const nextKrz = Math.round(targetPin.baseValue * multiplier);
-        return {
+        next = {
           ...prev,
           nodes: prev.nodes.map((n) =>
             n.id === targetPin.nodeId
@@ -7038,10 +7522,8 @@ function App() {
               : n
           ),
         };
-      }
-
-      if (targetPin.kind === 'load_magnitude') {
-        return {
+      } else if (targetPin.kind === 'load_magnitude') {
+        next = {
           ...prev,
           loads: prev.loads.map((ld) => {
             if (ld.id !== targetPin.loadId) return ld;
@@ -7070,8 +7552,8 @@ function App() {
           }),
         };
       }
-
-      return prev;
+      modelRef.current = next;
+      return next;
     });
   };
 
@@ -7083,12 +7565,12 @@ function App() {
 
   // JSON Export / Import
   const handleExportJson = () => {
-    const json = JSON.stringify(model, null, 2);
+    const json = JSON.stringify(modelRef.current, null, 2);
     const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${model.name.toLowerCase().replace(/\s+/g, '_')}.fem.json`;
+    a.download = `${modelRef.current.name.toLowerCase().replace(/\s+/g, '_')}.fem.json`;
     a.click();
     URL.revokeObjectURL(url);
     showToast('Exported structural model to JSON.');
@@ -7102,7 +7584,7 @@ function App() {
         return;
       }
       updateModelWithHistory(() => parsed, true);
-      setViewport((vp) => fitModelToViewport(parsed.nodes, vp.width, vp.height, vp));
+      fitNodesToUsableCanvas(parsed.nodes);
       showToast(`Imported "${parsed.name || 'Custom Model'}" successfully.`);
     } catch {
       showToast('Failed to parse JSON file.');
@@ -7110,68 +7592,65 @@ function App() {
   };
 
   return (
-    React.createElement("div", { "className": "flex flex-col w-screen h-screen bg-slate-950 text-slate-100 overflow-hidden font-sans" }, React.createElement(Toolbar, { "activePresetId": activePresetId, "onSelectPreset": handleSelectPreset, "activeTool": activeTool, "onSelectTool": (t) => {
+    React.createElement("div", { "className": "flex flex-col w-screen h-screen bg-slate-50 text-slate-900 overflow-hidden font-sans" }, React.createElement(Toolbar, { "activePresetId": activePresetId, "onSelectPreset": handleSelectPreset, "onNewProject": handleNewBlankProject, "activeTool": activeTool, "onSelectTool": (t) => {
           setActiveTool(t);
           setDrawStartPoint(null);
         }, "canUndo": undoStack.length > 0, "canRedo": redoStack.length > 0, "onUndo": handleUndo, "onRedo": handleRedo, "onExportJson": handleExportJson, "onImportJson": handleImportJson, "onZoomIn": () =>
           setViewport((vp) => ({ ...vp, zoom: Math.min(280, vp.zoom * 1.2) }))
         , "onZoomOut": () =>
           setViewport((vp) => ({ ...vp, zoom: Math.max(18, vp.zoom / 1.2) }))
-        , "onFitView": () =>
-          setViewport((vp) => fitModelToViewport(model.nodes, vp.width, vp.height, vp))
-        , "coordSystem": viewport.coordSystem, "onToggleCoordSystem": () =>
+        , "onFitView": () => fitNodesToUsableCanvas(modelRef.current.nodes), "coordSystem": viewport.coordSystem, "onToggleCoordSystem": () =>
           setViewport((vp) => ({
             ...vp,
             coordSystem: vp.coordSystem === 'cartesian' ? 'polar' : 'cartesian',
           }))
-        , "solverOutput": solverOutput, "model": model }), React.createElement("main", { "className": "flex flex-1 min-h-0 relative overflow-hidden" }, React.createElement("div", { "ref": containerRef, "className": "relative flex-1 h-full overflow-hidden bg-slate-950", "onContextMenu": (e     ) => e.preventDefault() }, React.createElement(LayerTogglesBar, { "layers": layers, "onUpdateLayers": (patch) => setLayers((l) => ({ ...l, ...patch })), "hoverProbe": hoverProbe }), !solverOutput.stable ? (
-            React.createElement("div", { "id": "unstable-structure-banner", "className": "absolute top-16 left-3 z-20 max-w-lg bg-rose-950/95 border border-rose-500 text-rose-100 px-3.5 py-2 rounded-lg shadow-2xl text-xs" }, React.createElement("div", { "className": "font-bold text-rose-300 uppercase tracking-wide mb-0.5" }, "Unstable Structure — Mechanism or Insufficient Restraints"), React.createElement("div", { "className": "text-rose-200/90 font-mono text-[11px]" }, solverOutput.instabilityReason ||
+        , "solverOutput": solverOutput, "model": model }), React.createElement("main", { "className": "flex flex-1 min-h-0 relative overflow-hidden" }, React.createElement("div", { "ref": containerRef, "className": "relative flex-1 h-full overflow-hidden bg-white", "onContextMenu": (e     ) => e.preventDefault() }, React.createElement(LayerTogglesBar, { "layers": layers, "onUpdateLayers": (patch) => setLayers((l) => ({ ...l, ...patch })), "hoverProbe": hoverProbe }), !solverOutput.stable ? (
+            React.createElement("div", { "id": "unstable-structure-banner", "className": "absolute top-16 left-3 z-20 max-w-lg bg-red-50/95 border border-red-300 text-red-900 px-3.5 py-2 rounded-lg shadow-lg text-xs" }, React.createElement("div", { "className": "font-bold text-red-700 uppercase tracking-wide mb-0.5" }, "Unstable Structure — Mechanism or Insufficient Restraints"), React.createElement("div", { "className": "text-red-600 font-mono text-[11px]" }, solverOutput.instabilityReason ||
                   'Add supports, springs, or restrain free hinge mechanisms to restore stability.'))
           ) : null, toastMessage ? (
-            React.createElement("div", { "className": "absolute top-16 right-4 z-30 bg-slate-900/95 border border-sky-400/60 text-sky-200 px-3 py-1.5 rounded-lg shadow-xl text-xs font-mono" }, toastMessage)
+            React.createElement("div", { "className": "absolute top-16 right-4 z-30 bg-white/95 border border-blue-300 text-blue-800 px-3 py-1.5 rounded-lg shadow-md text-xs font-mono" }, toastMessage)
           ) : null, React.createElement("canvas", { "id": "structural-fem-canvas", "ref": canvasRef, "onMouseDown": handleCanvasMouseDown, "onMouseMove": handleCanvasMouseMove, "onMouseUp": handleCanvasMouseUp, "onWheel": handleCanvasWheel, "style": {
               width: `${viewport.width}px`,
               height: `${viewport.height}px`,
             }, "className": `block select-none ${
               activeTool === 'draw_member'
                 ? 'cursor-crosshair'
-                : activeTool === 'delete'
+                : activeTool === 'delete' || activeTool === 'assign_support'
                   ? 'cursor-pointer'
                   : 'cursor-default'
             }` }), React.createElement(ContextualPopup, { "model": model, "selectedNodeId": selectedNodeId, "selectedElementId": selectedElementId, "selectedLoadId": selectedLoadId, "onUpdateModel": updateModelWithHistory, "onClose": () => {
               setSelectedNodeId(null);
               setSelectedElementId(null);
               setSelectedLoadId(null);
-            }, "onDeleteEntity": handleDeleteSelected, "onPinParameter": handlePinParameter, "onQuickAddMemberLoad": handleQuickAddMemberLoad, "onQuickAddNodalLoad": handleQuickAddNodalLoad }), React.createElement("div", { "className": "absolute bottom-0 inset-x-0 h-7 bg-slate-900/90 backdrop-blur border-t border-slate-800 px-3 flex items-center justify-between text-[11px] font-mono text-slate-400 select-none pointer-events-none" }, React.createElement("div", { "className": "flex items-center gap-4" }, React.createElement("span", { "className": "text-sky-400 font-semibold" }, snapTarget
+            }, "onDeleteEntity": handleDeleteSelected, "onPinParameter": handlePinParameter, "onQuickAddMemberLoad": handleQuickAddMemberLoad, "onQuickAddNodalLoad": handleQuickAddNodalLoad, "onSelectEntity": handleSelectEntity }), React.createElement("div", { "className": "absolute bottom-0 inset-x-0 h-7 bg-white/95 backdrop-blur border-t border-slate-200 px-3 flex items-center justify-between text-[11px] font-mono text-slate-600 select-none pointer-events-none" }, React.createElement("div", { "className": "flex items-center gap-4" }, React.createElement("span", { "className": "text-blue-700 font-semibold" }, snapTarget
                   ? `X: ${snapTarget.x.toFixed(1)} m, Y: ${snapTarget.y.toFixed(1)} m (Z: 0.0 m)`
-                  : 'X: 0.0 m, Y: 0.0 m'), React.createElement("span", { "className": "hidden sm:inline text-slate-500" }, "|"), React.createElement("span", { "className": "hidden sm:inline text-slate-300" }, activeTool === 'select'
-                  ? 'Click any Member, Node, or Load to edit parameters · Drag background to pan · Scroll to zoom'
+                  : 'X: 0.0 m, Y: 0.0 m'), React.createElement("span", { "className": "hidden sm:inline text-slate-300" }, "|"), React.createElement("span", { "className": "hidden sm:inline text-slate-600" }, activeTool === 'select'
+                  ? 'Click any Member, Node, or Load to edit (click repeatedly on busy node to cycle) · Drag background to pan'
                   : activeTool === 'draw_member'
                     ? drawStartPoint
                       ? 'Click or release on end point (snaps to 0.1m grid, existing nodes, or T-splits members)'
-                      : 'Click start point to draw new 1D Frame Member'
+                      : 'Click or drag from start point to draw new 1D Frame Member'
                     : activeTool === 'assign_support'
-                      ? 'Click any node to cycle/edit support restraint (Fixed, Pinned, Roller, Inclined)'
+                      ? 'Click any node (16 px radius) to cycle support: Pinned → Fixed → Roller X → Roller Y → None'
                       : activeTool === 'add_nodal_load'
                         ? 'Click any node to add a concentrated Nodal Load'
                         : activeTool === 'add_member_load'
                           ? 'Click any member to add a Distributed (UDL/Trapezoidal) or Point Load'
-                          : 'Click any Member, Node, or Load to delete it')), React.createElement("div", { "className": "flex items-center gap-3" }, React.createElement("span", null, "Nodes: ", model.nodes.length), React.createElement("span", null, "Members: ", model.elements.length), React.createElement("span", null, "Loads: ", model.loads.length), React.createElement("span", null, "Grid: 0.1 m")))), React.createElement(SensitivityPanel, { "model": model, "solverOutput": solverOutput, "layers": layers, "onUpdateLayers": (patch) => setLayers((l) => ({ ...l, ...patch })), "pinnedParams": pinnedParams, "onSlidePinnedParam": handleSlidePinnedParam, "onUnpinParam": (pinId) =>
+                          : 'Click any Member, Node, or Load to delete it')), React.createElement("div", { "className": "flex items-center gap-3 text-slate-500" }, React.createElement("span", null, "Nodes: ", model.nodes.length), React.createElement("span", null, "Members: ", model.elements.length), React.createElement("span", null, "Loads: ", model.loads.length), React.createElement("span", null, "Grid: 0.1 m")))), React.createElement(SensitivityPanel, { "model": model, "solverOutput": solverOutput, "layers": layers, "onUpdateLayers": (patch) => setLayers((l) => ({ ...l, ...patch })), "pinnedParams": pinnedParams, "onSlidePinnedParam": handleSlidePinnedParam, "onUnpinParam": (pinId) =>
             setPinnedParams((prev) => prev.filter((p) => p.id !== pinId))
-          , "onResetPinnedParams": handleResetPinnedParams, "onAddQuickPin": handlePinParameter, "onSelectEntity": (kind, id) => {
-            if (kind === 'node') {
-              setSelectedNodeId(id);
-              setSelectedElementId(null);
-              setSelectedLoadId(null);
-            } else if (kind === 'member') {
-              setSelectedElementId(id);
-              setSelectedNodeId(null);
-              setSelectedLoadId(null);
-            } else {
-              setSelectedLoadId(id);
-              setSelectedNodeId(null);
-              setSelectedElementId(null);
-            }
+          , "onResetPinnedParams": handleResetPinnedParams, "onAddQuickPin": handlePinParameter, "onSelectEntity": handleSelectEntity, "onCollapseChange": () => {
+            setTimeout(() => {
+              const el = containerRef.current;
+              if (!el) return;
+              const rect = el.getBoundingClientRect();
+              if (rect.width > 0 && rect.height > 0) {
+                setViewport((vp) => ({
+                  ...vp,
+                  width: rect.width,
+                  height: rect.height,
+                }));
+              }
+            }, 0);
           } })))
   );
 }

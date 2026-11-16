@@ -4,15 +4,19 @@ import {
   splitMemberAtPoint,
   canAddMember,
   probeMemberAtCursor,
+  findNodeWithinRadius,
+  hitTestAllCanvasEntities,
 } from '../src/utils/geometry.ts';
 import {
   polarToCartesian,
   cartesianToPolar,
   computeSmartSnap,
   fitModelToViewport,
+  worldToScreen,
+  screenToWorld,
 } from '../src/utils/coordinates.ts';
-import { analyzeStructure } from '../src/solver/index.ts';
-import { createBoxCulvertPreset, createContinuousBeamPreset } from '../src/presets/benchmarks.ts';
+import { analyzeStructure, computeCrossSection, restraintsFromSupportPreset } from '../src/solver/index.ts';
+import { createBoxCulvertPreset, createContinuousBeamPreset, createPrattTrussPreset } from '../src/presets/benchmarks.ts';
 import { CanvasRenderer, type SnapshotOverlayMode } from '../src/renderer/CanvasRenderer.ts';
 
 test('T-Junction Mid-Span Member Auto-Splitting Preserves Equilibrium and Splits Trapezoidal Loads', () => {
@@ -72,6 +76,98 @@ test('Polar Coordinate Converter and Smart Snapping', () => {
   assert.ok(probe !== null);
   assert.equal(probe.element.id, 'M3');
   assert.ok(probe.station.deflectionMm > 0);
+});
+
+test('fitModelToViewport Handles Empty Canvas, Horizontal Single-Line Beam, and Vertical Column Cleanly', () => {
+  // 1. Empty canvas (0 nodes) -> resets cleanly to show x in [-1 m, 10 m], y in [-2 m, 6 m]
+  const emptyVp = fitModelToViewport([], 960, 640);
+  assert.ok(Number.isFinite(emptyVp.zoom) && emptyVp.zoom > 0);
+  assert.ok(Number.isFinite(emptyVp.panX));
+  assert.ok(Number.isFinite(emptyVp.panY));
+
+  // Center of [-1, 10] x [-2, 6] is (4.5, 2.0), which maps to (width * 0.5, height * 0.52)
+  const centerWorld = screenToWorld(960 * 0.5, 640 * 0.52, emptyVp);
+  assert.ok(Math.abs(centerWorld.x - 4.5) < 0.05);
+  assert.ok(Math.abs(centerWorld.y - 2.0) < 0.05);
+
+  // 2. Degenerate horizontal beam (maxY === minY = 0)
+  const beam = createContinuousBeamPreset();
+  const beamVp = fitModelToViewport(beam.nodes, 960, 640);
+  assert.ok(Number.isFinite(beamVp.zoom) && beamVp.zoom > 15 && beamVp.zoom < 300);
+  assert.ok(Number.isFinite(beamVp.panX) && Number.isFinite(beamVp.panY));
+
+  // 3. Degenerate vertical column (maxX === minX = 0)
+  const verticalNodes = [
+    {
+      id: 'N1',
+      label: 'N1',
+      x: 0,
+      y: 0,
+      z: 0,
+      support: 'fixed' as const,
+      restraints: restraintsFromSupportPreset('fixed'),
+      springs: { kx: 0, ky: 0, kz: 0, krx: 0, kry: 0, krz: 0 },
+    },
+    {
+      id: 'N2',
+      label: 'N2',
+      x: 0,
+      y: 4,
+      z: 0,
+      support: 'none' as const,
+      restraints: restraintsFromSupportPreset('none'),
+      springs: { kx: 0, ky: 0, kz: 0, krx: 0, kry: 0, krz: 0 },
+    },
+  ];
+  const colVp = fitModelToViewport(verticalNodes, 960, 640);
+  assert.ok(Number.isFinite(colVp.zoom) && colVp.zoom > 15 && colVp.zoom < 300);
+  assert.ok(Number.isFinite(colVp.panX) && Number.isFinite(colVp.panY));
+});
+
+test('16px Node Hit-Testing (findNodeWithinRadius) and Busy Node Click-Through Entity Cycling', () => {
+  const truss = createPrattTrussPreset();
+  // Add a second nodal load at Node N3 (x = 6, y = 0) so N3 has 2 nodal loads (L2, L4) + connected members
+  truss.loads.push({
+    id: 'L4',
+    kind: 'nodal',
+    nodeId: 'N3',
+    fx: 15,
+    fy: 0,
+    mz: 10,
+    label: 'Lateral Joint Load',
+  });
+
+  const vp = fitModelToViewport(truss.nodes, 1000, 700);
+  const n3 = truss.nodes.find((n) => n.id === 'N3')!;
+  const n3Screen = worldToScreen(n3, vp);
+
+  // 1. Node hit-testing within 16 px radius works at ~13.45 px offset
+  const hit14px = findNodeWithinRadius(n3Screen.sx + 10, n3Screen.sy - 9, vp, truss.nodes, 16);
+  assert.ok(hit14px !== null);
+  assert.equal(hit14px.node.id, 'N3');
+
+  // Outside 16 px radius returns null
+  const miss24px = findNodeWithinRadius(n3Screen.sx + 20, n3Screen.sy + 20, vp, truss.nodes, 16);
+  assert.equal(miss24px, null);
+
+  // 2. Click-through cycling at busy Node N3 returns Node -> Nodal Load #1 -> Nodal Load #2 -> Connected Members
+  const entities = hitTestAllCanvasEntities(n3Screen.sx, n3Screen.sy, vp, truss, []);
+  assert.ok(entities.length >= 4, `Expected at least 4 overlapping entities at N3, got ${entities.length}`);
+  assert.equal(entities[0].kind, 'node');
+  if (entities[0].kind === 'node') assert.equal(entities[0].nodeId, 'N3');
+  assert.equal(entities[1].kind, 'load');
+  if (entities[1].kind === 'load') assert.equal(entities[1].loadId, 'L2');
+  assert.equal(entities[2].kind, 'load');
+  if (entities[2].kind === 'load') assert.equal(entities[2].loadId, 'L4');
+  assert.equal(entities[3].kind, 'member');
+});
+
+test('Direct Cross-Section Dimension Editing Recomputes A, I, S via computeCrossSection', () => {
+  const secBefore = computeCrossSection('rectangular', { b: 300, h: 500 });
+  const secAfter = computeCrossSection('rectangular', { b: 300, h: 750 });
+  assert.ok(secAfter.A > secBefore.A);
+  assert.ok(secAfter.I > secBefore.I);
+  assert.ok(secAfter.S > secBefore.S);
 });
 
 test('SolverResults JSON Serializability, Envelope Extrema (x/L), and Governing Utilization', () => {

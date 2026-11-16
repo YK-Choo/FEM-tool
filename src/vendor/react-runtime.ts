@@ -1,8 +1,8 @@
 /**
  * Lightweight, Fine-Grained React 18-Compatible VDOM Runtime & Hooks Engine
  *
- * Preserves DOM nodes (<canvas>, focused <input>, active range sliders, SVG icons)
- * across state updates for smooth 60fps CAD interaction and real-time sensitivity sliders.
+ * Keyed by virtual tree path (`__vpath`) so conditional siblings (`{cond ? <Popup/> : null}`)
+ * never shift hook state paths or remount persistent DOM nodes like `<canvas>` or `<input>`.
  */
 
 export const Fragment = Symbol.for('react.fragment');
@@ -23,23 +23,13 @@ export function createElement(
   const key = normalizedProps.key !== undefined ? normalizedProps.key : null;
   delete normalizedProps.key;
 
-  const flatChildren: any[] = [];
-  const flatten = (arr: any[]) => {
-    for (const item of arr) {
-      if (Array.isArray(item)) {
-        flatten(item);
-      } else if (item !== null && item !== undefined && item !== false && item !== true) {
-        flatChildren.push(item);
-      }
-    }
-  };
-  flatten(rawChildren);
-
-  normalizedProps.children = flatChildren;
+  // Keep rawChildren structure (including null/boolean slots) so positional child indices
+  // never shift when a conditional expression toggles between null and an element!
+  normalizedProps.children = rawChildren;
   return {
     type,
     props: normalizedProps,
-    children: flatChildren,
+    children: rawChildren,
     key,
   };
 }
@@ -68,7 +58,9 @@ export function flushSyncRender() {
   if (activeRootRender) activeRootRender();
 }
 
-export function useState<T>(initialValue: T | (() => T)): [T, (next: T | ((prev: T) => T)) => void] {
+export function useState<T>(
+  initialValue: T | (() => T)
+): [T, (next: T | ((prev: T) => T)) => void] {
   if (!currentInstance) throw new Error('useState called outside component');
   const inst = currentInstance;
   const idx = inst.hookIndex++;
@@ -173,7 +165,6 @@ const SVG_ATTR_MAP: Record<string, string> = {
   dominantBaseline: 'dominant-baseline',
 };
 
-// Expand functional components and fragments into concrete DOM-ready VNodes
 const componentInstances = new Map<string, ComponentInstance>();
 let usedPathsInPass = new Set<string>();
 let pendingEffectsQueue: Array<() => void> = [];
@@ -187,10 +178,12 @@ function expandVNode(node: any, path: string): any[] {
   }
   if (Array.isArray(node)) {
     const res: any[] = [];
-    node.forEach((child, i) => {
-      const k = child && typeof child === 'object' && child.key != null ? `k:${child.key}` : `i:${i}`;
+    for (let i = 0; i < node.length; i++) {
+      const child = node[i];
+      const k =
+        child && typeof child === 'object' && child.key != null ? `k:${child.key}` : `i:${i}`;
       res.push(...expandVNode(child, `${path}/${k}`));
-    });
+    }
     return res;
   }
   if (node.type === Fragment) {
@@ -225,12 +218,14 @@ function expandVNode(node: any, path: string): any[] {
     return expandVNode(rendered, instKey);
   }
 
-  // Native DOM element
+  // Native DOM element: preserve slot index `i` across all rawChildren (even null slots)
   const expandedChildren: any[] = [];
-  node.children.forEach((child: any, i: number) => {
-    const k = child && typeof child === 'object' && child.key != null ? `k:${child.key}` : `i:${i}`;
+  for (let i = 0; i < node.children.length; i++) {
+    const child = node.children[i];
+    const k =
+      child && typeof child === 'object' && child.key != null ? `k:${child.key}` : `s:${i}`;
     expandedChildren.push(...expandVNode(child, `${path}/${node.type}/${k}`));
-  });
+  }
 
   return [
     {
@@ -238,7 +233,7 @@ function expandVNode(node: any, path: string): any[] {
       props: node.props,
       children: expandedChildren,
       key: node.key,
-      path,
+      path: `${path}/${node.type}`,
     },
   ];
 }
@@ -252,15 +247,23 @@ function applyProps(
   const prevListeners: Record<string, any> = (dom as any).__listeners || {};
   (dom as any).__listeners = prevListeners;
 
-  // Remove old props
   for (const k of Object.keys(prevProps)) {
     if (k === 'children' || k === 'ref') continue;
     if (!(k in nextProps)) {
       if (k.startsWith('on') && k.length > 2) {
-        const evt = k.slice(2).toLowerCase();
-        if (prevListeners[evt]) {
-          dom.removeEventListener(evt, prevListeners[evt]);
-          delete prevListeners[evt];
+        const rawName = k.slice(2).toLowerCase();
+        const evtName =
+          rawName === 'change' &&
+          (dom.tagName === 'INPUT' || dom.tagName === 'TEXTAREA') &&
+          (dom as HTMLInputElement).type !== 'checkbox' &&
+          (dom as HTMLInputElement).type !== 'file'
+            ? 'input'
+            : rawName === 'doubleclick'
+              ? 'dblclick'
+              : rawName;
+        if (prevListeners[evtName]) {
+          dom.removeEventListener(evtName, prevListeners[evtName]);
+          delete prevListeners[evtName];
         }
       } else if (k === 'className') {
         dom.removeAttribute('class');
@@ -272,7 +275,6 @@ function applyProps(
     }
   }
 
-  // Set new/updated props
   for (const [k, val] of Object.entries(nextProps)) {
     if (k === 'children') continue;
     if (k === 'ref') {
@@ -285,7 +287,6 @@ function applyProps(
     }
 
     if (k.startsWith('on') && k.length > 2 && typeof val === 'function') {
-      // Map React's onChange on <input>/<select>/<textarea> to both 'input' and 'change' for instant live updates
       const rawName = k.slice(2).toLowerCase();
       const evtName =
         rawName === 'change' &&
@@ -355,42 +356,54 @@ function applyProps(
   }
 }
 
-function reconcileChildren(
-  parentDom: Node,
-  nextVNodes: any[],
-  isSvgContext: boolean
-) {
+/**
+ * Reconcile children by matching existing DOM nodes via `__vpath` first (falling back to index/tag),
+ * so inserting/removing conditional banners or pop-ups never destroys sibling `<canvas>` or `<input>` elements.
+ */
+function reconcileChildren(parentDom: Node, nextVNodes: any[], isSvgContext: boolean) {
   const existingNodes = Array.from(parentDom.childNodes);
+  const byPath = new Map<string, Node>();
+  for (const n of existingNodes) {
+    const p = (n as any).__vpath;
+    if (p) byPath.set(p, n);
+  }
+
+  const usedDomNodes = new Set<Node>();
+  const resolvedDomNodes: Node[] = [];
 
   for (let i = 0; i < nextVNodes.length; i++) {
     const vnode = nextVNodes[i];
-    const existing = existingNodes[i];
+    let matched = byPath.get(vnode.path);
+
+    if (matched && usedDomNodes.has(matched)) {
+      matched = undefined;
+    }
 
     if (vnode.type === '#text') {
-      if (existing && existing.nodeType === Node.TEXT_NODE) {
-        if (existing.nodeValue !== vnode.text) {
-          existing.nodeValue = vnode.text;
+      let textNode: Node;
+      if (matched && matched.nodeType === Node.TEXT_NODE) {
+        textNode = matched;
+        if (textNode.nodeValue !== vnode.text) {
+          textNode.nodeValue = vnode.text;
         }
       } else {
-        const textNode = document.createTextNode(vnode.text);
-        if (existing) {
-          parentDom.replaceChild(textNode, existing);
-        } else {
-          parentDom.appendChild(textNode);
-        }
+        textNode = document.createTextNode(vnode.text);
       }
+      (textNode as any).__vpath = vnode.path;
+      usedDomNodes.add(textNode);
+      resolvedDomNodes.push(textNode);
       continue;
     }
 
     const isSvg = isSvgContext || SVG_TAGS.has(vnode.type);
     const tagMatch =
-      existing &&
-      existing.nodeType === Node.ELEMENT_NODE &&
-      (existing as Element).tagName.toLowerCase() === vnode.type.toLowerCase();
+      matched &&
+      matched.nodeType === Node.ELEMENT_NODE &&
+      (matched as Element).tagName.toLowerCase() === vnode.type.toLowerCase();
 
     let domEl: HTMLElement | SVGElement;
     if (tagMatch) {
-      domEl = existing as HTMLElement | SVGElement;
+      domEl = matched as HTMLElement | SVGElement;
       const prevProps = (domEl as any).__vprops || {};
       applyProps(domEl, vnode.props, prevProps, isSvg);
       (domEl as any).__vprops = vnode.props;
@@ -400,16 +413,14 @@ function reconcileChildren(
         : document.createElement(vnode.type);
       applyProps(domEl, vnode.props, {}, isSvg);
       (domEl as any).__vprops = vnode.props;
-      if (existing) {
-        parentDom.replaceChild(domEl, existing);
-      } else {
-        parentDom.appendChild(domEl);
-      }
     }
+
+    (domEl as any).__vpath = vnode.path;
+    usedDomNodes.add(domEl);
+    resolvedDomNodes.push(domEl);
 
     reconcileChildren(domEl, vnode.children, isSvg);
 
-    // Ensure <select> reflects its controlled value after <option> children are reconciled
     if (!isSvg && vnode.type === 'select' && vnode.props.value !== undefined) {
       const selStr = String(vnode.props.value);
       if ((domEl as HTMLSelectElement).value !== selStr) {
@@ -418,43 +429,69 @@ function reconcileChildren(
     }
   }
 
-  // Remove any extra trailing DOM nodes
-  while (parentDom.childNodes.length > nextVNodes.length) {
-    const last = parentDom.lastChild;
-    if (last) parentDom.removeChild(last);
+  // Remove any old DOM nodes that are no longer in resolvedDomNodes
+  for (const oldNode of existingNodes) {
+    if (!usedDomNodes.has(oldNode)) {
+      parentDom.removeChild(oldNode);
+    }
+  }
+
+  // Ensure exact DOM order without disturbing already-ordered persistent nodes (like <canvas>)
+  for (let i = 0; i < resolvedDomNodes.length; i++) {
+    const desired = resolvedDomNodes[i];
+    const currentAtI = parentDom.childNodes[i];
+    if (currentAtI !== desired) {
+      if (typeof (parentDom as any).insertBefore === 'function') {
+        parentDom.insertBefore(desired, currentAtI || null);
+      } else {
+        parentDom.appendChild(desired);
+      }
+    }
   }
 }
 
 export function createRoot(container: HTMLElement) {
   let rootVNode: any = null;
+  let isRendering = false;
+  let dirtyDuringRender = false;
 
   const performRender = () => {
     if (!rootVNode) return;
-    usedPathsInPass = new Set<string>();
-    pendingEffectsQueue = [];
+    if (isRendering) {
+      dirtyDuringRender = true;
+      return;
+    }
+    isRendering = true;
+    try {
+      do {
+        dirtyDuringRender = false;
+        usedPathsInPass = new Set<string>();
+        pendingEffectsQueue = [];
 
-    const expanded = expandVNode(rootVNode, 'root');
-    reconcileChildren(container, expanded, false);
+        const expanded = expandVNode(rootVNode, 'root');
+        reconcileChildren(container, expanded, false);
 
-    // Cleanup unmounted component instances
-    for (const [k, inst] of componentInstances.entries()) {
-      if (!usedPathsInPass.has(k)) {
-        for (const h of inst.hooks) {
-          if (h && typeof h.cleanup === 'function') {
-            try {
-              h.cleanup();
-            } catch {}
+        for (const [k, inst] of componentInstances.entries()) {
+          if (!usedPathsInPass.has(k)) {
+            for (const h of inst.hooks) {
+              if (h && typeof h.cleanup === 'function') {
+                try {
+                  h.cleanup();
+                } catch {}
+              }
+            }
+            componentInstances.delete(k);
           }
         }
-        componentInstances.delete(k);
-      }
-    }
 
-    // Run queued useEffects
-    const effects = [...pendingEffectsQueue];
-    pendingEffectsQueue = [];
-    for (const eff of effects) {
-      eff();
+        const effects = [...pendingEffectsQueue];
+        pendingEffectsQueue = [];
+        for (const eff of effects) {
+          eff();
+        }
+      } while (dirtyDuringRender);
+    } finally {
+      isRendering = false;
     }
   };
 

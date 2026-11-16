@@ -369,17 +369,17 @@ export type PinnedParameterTarget =
   | {
       id: string;
       label: string;
-      kind: 'member_depth';
+      kind: 'member_E';
       elementId: string;
-      baseValue: number; // mm
+      baseValue: number; // GPa
       multiplier: number; // 0.2x to 3.0x
     }
   | {
       id: string;
       label: string;
-      kind: 'member_E';
-      elementId: string;
-      baseValue: number; // GPa
+      kind: 'node_spring_kx';
+      nodeId: string;
+      baseValue: number; // kN/m
       multiplier: number;
     }
   | {
@@ -407,3 +407,4 @@ export type PinnedParameterTarget =
       baseSecondary?: number;
       multiplier: number;
     };
+

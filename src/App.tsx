@@ -20,6 +20,8 @@ import {
 } from './utils/coordinates.ts';
 import {
   hitTestCanvas,
+  hitTestAllCanvasEntities,
+  findNodeWithinRadius,
   probeMemberAtCursor,
   splitMemberAtPoint,
   canAddMember,
@@ -44,7 +46,7 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
     const l1 = model.loads.find((l) => l.id === 'L1');
     if (l1 && l1.kind === 'member_distributed') {
       pins.push({
-        id: 'pin_L1',
+        id: 'pin_load_magnitude_L1',
         label: 'Left Wall Earth+Water (L1)',
         kind: 'load_magnitude',
         loadId: 'L1',
@@ -56,7 +58,7 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
     const l3 = model.loads.find((l) => l.id === 'L3');
     if (l3 && l3.kind === 'member_distributed') {
       pins.push({
-        id: 'pin_L3',
+        id: 'pin_load_magnitude_L3',
         label: 'Roof Soil Surcharge (L3)',
         kind: 'load_magnitude',
         loadId: 'L3',
@@ -68,18 +70,18 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
     const m3 = model.elements.find((e): e is Frame2DElement => e.id === 'M3' && e.kind === 'frame2d');
     if (m3) {
       pins.push({
-        id: 'pin_M3_h',
-        label: 'Roof Slab Depth h (M3)',
-        kind: 'member_depth',
+        id: 'pin_member_E_M3',
+        label: 'Roof Slab Modulus E (M3)',
+        kind: 'member_E',
         elementId: 'M3',
-        baseValue: m3.section.depthMm,
+        baseValue: m3.material.E,
         multiplier: 1.0,
       });
     }
     const n5 = model.nodes.find((n) => n.id === 'N5');
     if (n5) {
       pins.push({
-        id: 'pin_N5_ky',
+        id: 'pin_node_spring_ky_N5',
         label: 'Center Soil Spring ky (N5)',
         kind: 'node_spring_ky',
         nodeId: 'N5',
@@ -94,7 +96,7 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
     const l1 = model.loads.find((l) => l.id === 'L1');
     if (l1 && l1.kind === 'member_point') {
       pins.push({
-        id: 'pin_L1',
+        id: 'pin_load_magnitude_L1',
         label: 'Lateral Wind Load P (L1)',
         kind: 'load_magnitude',
         loadId: 'L1',
@@ -105,7 +107,7 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
     const l2 = model.loads.find((l) => l.id === 'L2');
     if (l2 && l2.kind === 'member_distributed') {
       pins.push({
-        id: 'pin_L2',
+        id: 'pin_load_magnitude_L2',
         label: 'Bay 1 Roof UDL (L2)',
         kind: 'load_magnitude',
         loadId: 'L2',
@@ -117,11 +119,11 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
     const m2 = model.elements.find((e): e is Frame2DElement => e.id === 'M2' && e.kind === 'frame2d');
     if (m2) {
       pins.push({
-        id: 'pin_M2_h',
-        label: 'Center Column Depth h (M2)',
-        kind: 'member_depth',
+        id: 'pin_member_E_M2',
+        label: 'Center Column Modulus E (M2)',
+        kind: 'member_E',
         elementId: 'M2',
-        baseValue: m2.section.depthMm,
+        baseValue: m2.material.E,
         multiplier: 1.0,
       });
     }
@@ -132,7 +134,7 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
     const n2 = model.nodes.find((n) => n.id === 'N2');
     if (n2) {
       pins.push({
-        id: 'pin_N2_krz',
+        id: 'pin_node_spring_krz_N2',
         label: 'Center Pier Spring kθ (N2)',
         kind: 'node_spring_krz',
         nodeId: 'N2',
@@ -143,7 +145,7 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
     const l1 = model.loads.find((l) => l.id === 'L1');
     if (l1 && l1.kind === 'member_distributed') {
       pins.push({
-        id: 'pin_L1',
+        id: 'pin_load_magnitude_L1',
         label: 'Span 1 UDL w (L1)',
         kind: 'load_magnitude',
         loadId: 'L1',
@@ -155,7 +157,7 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
     const l2 = model.loads.find((l) => l.id === 'L2');
     if (l2 && l2.kind === 'member_point') {
       pins.push({
-        id: 'pin_L2',
+        id: 'pin_load_magnitude_L2',
         label: 'Span 2 Point Load P (L2)',
         kind: 'load_magnitude',
         loadId: 'L2',
@@ -170,7 +172,7 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
   const l2 = model.loads.find((l) => l.id === 'L2');
   if (l2 && l2.kind === 'nodal') {
     pins.push({
-      id: 'pin_L2',
+      id: 'pin_load_magnitude_L2',
       label: 'Center Joint Load Fy (L2)',
       kind: 'load_magnitude',
       loadId: 'L2',
@@ -181,7 +183,7 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
   const m6 = model.elements.find((e): e is Frame2DElement => e.id === 'M6' && e.kind === 'frame2d');
   if (m6) {
     pins.push({
-      id: 'pin_M6_E',
+      id: 'pin_member_E_M6',
       label: 'Top Chord Modulus E (M6)',
       kind: 'member_E',
       elementId: 'M6',
@@ -193,6 +195,13 @@ function buildDefaultPinsForPreset(presetId: string, model: StructuralModel): Pi
 }
 
 const rendererInstance = new CanvasRenderer();
+
+type DraftStartPoint = {
+  x: number;
+  y: number;
+  nodeId?: string;
+  splitElementId?: string;
+};
 
 export function App() {
   const initialPreset = BENCHMARK_PRESETS[0];
@@ -239,18 +248,39 @@ export function App() {
   });
 
   const [snapTarget, setSnapTarget] = React.useState<SnapResult | null>(null);
-  const [drawStartPoint, setDrawStartPoint] = React.useState<{
-    x: number;
-    y: number;
-    nodeId?: string;
-    splitElementId?: string;
-  } | null>(null);
+  const [drawStartPoint, setDrawStartPointState] = React.useState<DraftStartPoint | null>(null);
   const [hoverProbe, setHoverProbe] = React.useState<HoverProbeData | null>(null);
   const [toastMessage, setToastMessage] = React.useState<string | null>(null);
 
   const canvasRef = React.useRef<HTMLCanvasElement | null>(null);
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const loadHandlesRef = React.useRef<LoadScreenHandle[]>([]);
+
+  // Synchronized mutable refs to prevent stale React state closures in pointer/mouse event handlers
+  const modelRef = React.useRef<StructuralModel>(model);
+  modelRef.current = model;
+  const viewportRef = React.useRef<ViewportTransform>(viewport);
+  viewportRef.current = viewport;
+  const activeToolRef = React.useRef<ActiveToolMode>(activeTool);
+  activeToolRef.current = activeTool;
+  const drawStartPointRef = React.useRef<DraftStartPoint | null>(drawStartPoint);
+
+  const setDrawStartPoint = (pt: DraftStartPoint | null) => {
+    drawStartPointRef.current = pt;
+    setDrawStartPointState(pt);
+  };
+
+  // Track click-through selection cycling at busy nodes (within 8 px of previous click)
+  const lastSelectClickRef = React.useRef<{
+    sx: number;
+    sy: number;
+    cycleIndex: number;
+  }>({
+    sx: -9999,
+    sy: -9999,
+    cycleIndex: 0,
+  });
+
   const panDragRef = React.useRef<{
     active: boolean;
     startSx: number;
@@ -281,21 +311,22 @@ export function App() {
     updater: (prev: StructuralModel) => StructuralModel,
     recordUndo: boolean = true
   ) => {
-    setModel((prev) => {
-      const next = updater(structuredClone(prev));
-      if (recordUndo) {
-        setUndoStack((u) => [...u.slice(-29), prev]);
-        setRedoStack([]);
-      }
-      return next;
-    });
+    const prev = modelRef.current;
+    const next = updater(structuredClone(prev));
+    modelRef.current = next;
+    if (recordUndo) {
+      setUndoStack((u) => [...u.slice(-29), prev]);
+      setRedoStack([]);
+    }
+    setModel(next);
   };
 
   const handleUndo = () => {
     if (undoStack.length === 0) return;
     const prevModel = undoStack[undoStack.length - 1];
     setUndoStack((u) => u.slice(0, -1));
-    setRedoStack((r) => [...r, model]);
+    setRedoStack((r) => [...r, modelRef.current]);
+    modelRef.current = prevModel;
     setModel(prevModel);
   };
 
@@ -303,8 +334,34 @@ export function App() {
     if (redoStack.length === 0) return;
     const nextModel = redoStack[redoStack.length - 1];
     setRedoStack((r) => r.slice(0, -1));
-    setUndoStack((u) => [...u, model]);
+    setUndoStack((u) => [...u, modelRef.current]);
+    modelRef.current = nextModel;
     setModel(nextModel);
+  };
+
+  // Fit structure to usable canvas area (excluding top toolbar height & open right-hand Sensitivity Panel width)
+  const fitNodesToUsableCanvas = (nodesToFit: StructuralNode[]) => {
+    const el = containerRef.current;
+    const rect = el ? el.getBoundingClientRect() : null;
+    const usableW = rect && rect.width > 0 ? rect.width : viewportRef.current.width;
+    const usableH = rect && rect.height > 0 ? rect.height : viewportRef.current.height;
+    setViewport((vp) => fitModelToViewport(nodesToFit, usableW, usableH, vp));
+  };
+
+  const handleSelectEntity = (kind: 'node' | 'member' | 'load', id: string) => {
+    if (kind === 'node') {
+      setSelectedNodeId(id);
+      setSelectedElementId(null);
+      setSelectedLoadId(null);
+    } else if (kind === 'member') {
+      setSelectedElementId(id);
+      setSelectedNodeId(null);
+      setSelectedLoadId(null);
+    } else {
+      setSelectedLoadId(id);
+      setSelectedNodeId(null);
+      setSelectedElementId(null);
+    }
   };
 
   const handleSelectPreset = (presetId: string) => {
@@ -314,6 +371,7 @@ export function App() {
     setActivePresetId(presetId);
     setUndoStack([]);
     setRedoStack([]);
+    modelRef.current = freshModel;
     setModel(freshModel);
     setSelectedNodeId(null);
     setSelectedElementId(freshModel.elements[0]?.id ?? null);
@@ -342,7 +400,29 @@ export function App() {
       }));
     }
 
-    setViewport((vp) => fitModelToViewport(freshModel.nodes, vp.width, vp.height, vp));
+    fitNodesToUsableCanvas(freshModel.nodes);
+  };
+
+  // New Blank Project button handler: clears all nodes, members, loads, and sensitivity pins
+  // into an empty 0.1 m Cartesian workspace while pushing previous state onto Undo stack
+  const handleNewBlankProject = () => {
+    const blankModel: StructuralModel = {
+      name: 'Blank Project',
+      dimension: '2d',
+      nodes: [],
+      elements: [],
+      loads: [],
+    };
+    updateModelWithHistory(() => blankModel, true);
+    setPinnedParams([]);
+    setSelectedNodeId(null);
+    setSelectedElementId(null);
+    setSelectedLoadId(null);
+    setDrawStartPoint(null);
+    setHoverProbe(null);
+    setViewport((vp) => ({ ...vp, coordSystem: 'cartesian' }));
+    fitNodesToUsableCanvas([]);
+    showToast('Cleared workspace to new 0.1 m Cartesian project (Ctrl+Z to undo).');
   };
 
   // Fit viewport on mount and container resize
@@ -353,7 +433,7 @@ export function App() {
       const rect = el.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
         setViewport((vp) =>
-          fitModelToViewport(model.nodes, rect.width, rect.height, vp)
+          fitModelToViewport(modelRef.current.nodes, rect.width, rect.height, vp)
         );
       }
     };
@@ -509,27 +589,61 @@ export function App() {
     workingModel: StructuralModel,
     snap: SnapResult
   ): { model: StructuralModel; nodeId: string } => {
+    // 1. Reuse existing node if snap.nodeId is present and valid
     if (snap.kind === 'node' && snap.nodeId) {
-      return { model: workingModel, nodeId: snap.nodeId };
+      const exists = workingModel.nodes.find((n) => n.id === snap.nodeId);
+      if (exists) {
+        return { model: workingModel, nodeId: exists.id };
+      }
     }
-    if (snap.kind === 'member_segment' && snap.splitElementId) {
-      // Auto-split existing member at T-junction!
-      const splitRes = splitMemberAtPoint(
-        workingModel,
-        snap.splitElementId,
-        snap.x,
-        snap.y
-      );
-      showToast(`Auto-split member ${snap.splitElementId} at T-junction (${snap.x}m, ${snap.y}m)`);
-      return { model: splitRes.model, nodeId: splitRes.newNodeId };
-    }
-    // Check if a node already exists at (snap.x, snap.y)
-    const existing = workingModel.nodes.find(
+
+    // 2. Check if any existing node is already at (snap.x, snap.y)
+    const existingAtCoord = workingModel.nodes.find(
       (n) => Math.hypot(n.x - snap.x, n.y - snap.y) < 0.04
     );
-    if (existing) {
-      return { model: workingModel, nodeId: existing.id };
+    if (existingAtCoord) {
+      return { model: workingModel, nodeId: existingAtCoord.id };
     }
+
+    // 3. Auto-split existing member at mid-span intersection
+    if (snap.kind === 'member_segment' && snap.splitElementId) {
+      let targetElId: string | undefined = snap.splitElementId;
+      if (!workingModel.elements.some((e) => e.id === targetElId)) {
+        // If the start point already split this member, find which sub-member contains (snap.x, snap.y)
+        const nodeMap = new Map(workingModel.nodes.map((n) => [n.id, n]));
+        for (const el of workingModel.elements) {
+          if (el.kind !== 'frame2d') continue;
+          const ni = nodeMap.get(el.nodeI);
+          const nj = nodeMap.get(el.nodeJ);
+          if (!ni || !nj) continue;
+          const dx = nj.x - ni.x;
+          const dy = nj.y - ni.y;
+          const lenSq = dx * dx + dy * dy;
+          if (lenSq < 1e-9) continue;
+          const t = ((snap.x - ni.x) * dx + (snap.y - ni.y) * dy) / lenSq;
+          if (t > 0.02 && t < 0.98) {
+            const projX = ni.x + t * dx;
+            const projY = ni.y + t * dy;
+            if (Math.hypot(snap.x - projX, snap.y - projY) < 0.05) {
+              targetElId = el.id;
+              break;
+            }
+          }
+        }
+      }
+      if (targetElId && workingModel.elements.some((e) => e.id === targetElId)) {
+        const splitRes = splitMemberAtPoint(
+          workingModel,
+          targetElId,
+          snap.x,
+          snap.y
+        );
+        showToast(`Split member ${targetElId} at node ${splitRes.newNodeId} (${snap.x}m, ${snap.y}m)`);
+        return { model: splitRes.model, nodeId: splitRes.newNodeId };
+      }
+    }
+
+    // 4. Create and append a new StructuralNode (z = 0) at the 0.1 m grid coordinate
     const newNodeId = nextEntityId(
       'N',
       workingModel.nodes.map((n) => n.id)
@@ -552,12 +666,14 @@ export function App() {
 
   // Complete drawing a member from startSnap to endSnap
   const completeDrawMember = (
-    startSnap: { x: number; y: number; nodeId?: string; splitElementId?: string },
+    startSnap: DraftStartPoint,
     endSnap: SnapResult
   ) => {
     if (Math.hypot(endSnap.x - startSnap.x, endSnap.y - startSnap.y) < 0.05) {
       return;
     }
+
+    let createdElementId: string | null = null;
 
     updateModelWithHistory((prev) => {
       let working = prev;
@@ -576,7 +692,6 @@ export function App() {
       });
       working = startRes.model;
 
-      // Re-verify endSnap in case startSnap split the same element
       const endRes = resolveSnapPointToNode(working, endSnap);
       working = endRes.model;
 
@@ -610,24 +725,31 @@ export function App() {
         releaseEnd: false,
       };
 
-      setSelectedNodeId(null);
-      setSelectedLoadId(null);
-      setSelectedElementId(newElId);
+      createdElementId = newElId;
 
       return {
         ...working,
         elements: [...working.elements, newEl],
       };
     });
+
+    if (createdElementId) {
+      setSelectedNodeId(null);
+      setSelectedLoadId(null);
+      setSelectedElementId(createdElementId);
+    }
   };
 
-  // Canvas Mouse Handlers
+  // Canvas Mouse / Pointer Handlers
   const handleCanvasMouseDown = (e: any) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
+    const currentVp = viewportRef.current;
+    const currentModel = modelRef.current;
+    const currentTool = activeToolRef.current;
 
     // Middle mouse button or right mouse button -> pan
     if (e.button === 1 || e.button === 2) {
@@ -636,18 +758,27 @@ export function App() {
         active: true,
         startSx: sx,
         startSy: sy,
-        origPanX: viewport.panX,
-        origPanY: viewport.panY,
+        origPanX: currentVp.panX,
+        origPanY: currentVp.panY,
         moved: false,
       };
       return;
     }
 
-    const currentSnap = computeSmartSnap(sx, sy, viewport, model.nodes, model.elements);
+    const currentSnap = computeSmartSnap(
+      sx,
+      sy,
+      currentVp,
+      currentModel.nodes,
+      currentModel.elements
+    );
     setSnapTarget(currentSnap);
 
-    if (activeTool === 'draw_member') {
-      if (!drawStartPoint) {
+    // 1. Draw Member Tool: supports both Two-Click (click start -> move -> click end)
+    // and Click-and-Drag (mousedown start -> drag -> mouseup end)
+    if (currentTool === 'draw_member') {
+      const activeStart = drawStartPointRef.current;
+      if (!activeStart) {
         setDrawStartPoint({
           x: currentSnap.x,
           y: currentSnap.y,
@@ -655,63 +786,75 @@ export function App() {
           splitElementId: currentSnap.splitElementId,
         });
       } else {
-        completeDrawMember(drawStartPoint, currentSnap);
+        completeDrawMember(activeStart, currentSnap);
         setDrawStartPoint(null);
       }
       return;
     }
 
-    const hit = hitTestCanvas(sx, sy, viewport, model, loadHandlesRef.current);
-
-    if (activeTool === 'delete') {
-      if (hit) {
-        handleDeleteEntityById(hit.kind, hit.kind === 'node' ? hit.nodeId : hit.kind === 'member' ? hit.elementId : hit.loadId);
-      }
-      return;
-    }
-
-    if (activeTool === 'assign_support') {
-      if (hit && hit.kind === 'node') {
-        // Cycle support preset or select node to open support inspector
+    // 2. Assign Support Tool: generous 16 px screen-space node hit radius via worldToScreen
+    if (currentTool === 'assign_support') {
+      const nodeHit = findNodeWithinRadius(sx, sy, currentVp, currentModel.nodes, 16);
+      if (nodeHit) {
+        const targetNodeId = nodeHit.node.id;
+        const order: StructuralNode['support'][] = [
+          'pinned',
+          'fixed',
+          'rollerX',
+          'rollerY',
+          'none',
+        ];
+        let assignedSupport: StructuralNode['support'] = 'pinned';
         updateModelWithHistory((prev) => ({
           ...prev,
           nodes: prev.nodes.map((n) => {
-            if (n.id !== hit.nodeId) return n;
-            const order: StructuralNode['support'][] = [
-              'pinned',
-              'rollerX',
-              'fixed',
-              'inclinedRoller',
-              'none',
-            ];
-            const nextSup = order[(order.indexOf(n.support) + 1) % order.length];
+            if (n.id !== targetNodeId) return n;
+            const curIdx = order.indexOf(n.support);
+            const nextSup = order[(curIdx + 1) % order.length];
+            assignedSupport = nextSup;
             return {
               ...n,
               support: nextSup,
-              inclinedAngleDeg: nextSup === 'inclinedRoller' ? 30 : n.inclinedAngleDeg,
               restraints: restraintsFromSupportPreset(nextSup),
             };
           }),
         }));
-        setSelectedNodeId(hit.nodeId);
+        setSelectedNodeId(targetNodeId);
         setSelectedElementId(null);
         setSelectedLoadId(null);
+        showToast(`Node ${targetNodeId} support → ${assignedSupport}`);
       } else {
-        showToast('Click any node to assign or cycle its support restraint.');
+        showToast('Click within 16 px of any node to assign or cycle its support restraint.');
       }
       return;
     }
 
-    if (activeTool === 'add_nodal_load') {
-      if (hit && hit.kind === 'node') {
-        handleQuickAddNodalLoad(hit.nodeId);
+    // 3. Add Nodal Load Tool: generous 16 px screen-space node hit radius
+    if (currentTool === 'add_nodal_load') {
+      const nodeHit = findNodeWithinRadius(sx, sy, currentVp, currentModel.nodes, 16);
+      if (nodeHit) {
+        handleQuickAddNodalLoad(nodeHit.node.id);
       } else {
         showToast('Click any node to apply a concentrated Nodal Load (Fx, Fy, Mz).');
       }
       return;
     }
 
-    if (activeTool === 'add_member_load') {
+    const hit = hitTestCanvas(sx, sy, currentVp, currentModel, loadHandlesRef.current);
+
+    // 4. Delete Tool
+    if (currentTool === 'delete') {
+      if (hit) {
+        handleDeleteEntityById(
+          hit.kind,
+          hit.kind === 'node' ? hit.nodeId : hit.kind === 'member' ? hit.elementId : hit.loadId
+        );
+      }
+      return;
+    }
+
+    // 5. Add Member Load Tool
+    if (currentTool === 'add_member_load') {
       if (hit && hit.kind === 'member') {
         handleQuickAddMemberLoad(hit.elementId, 'distributed');
       } else {
@@ -720,28 +863,44 @@ export function App() {
       return;
     }
 
-    // Default 'select' mode: if clicked on background, start pan drag; if clicked on entity, open contextual pop-up
-    if (hit) {
-      if (hit.kind === 'node') {
-        setSelectedNodeId(hit.nodeId);
-        setSelectedElementId(null);
-        setSelectedLoadId(null);
-      } else if (hit.kind === 'member') {
-        setSelectedElementId(hit.elementId);
-        setSelectedNodeId(null);
-        setSelectedLoadId(null);
-      } else if (hit.kind === 'load') {
-        setSelectedLoadId(hit.loadId);
-        setSelectedNodeId(null);
-        setSelectedElementId(null);
+    // 6. Select / Inspect Tool: support Click-Through Cycling within 8 px over busy nodes!
+    // Cycle order: Node -> Nodal Load #1 -> Nodal Load #2 (etc.) -> Connected Member(s) -> back to Node
+    const allHits = hitTestAllCanvasEntities(
+      sx,
+      sy,
+      currentVp,
+      currentModel,
+      loadHandlesRef.current
+    );
+
+    if (allHits.length > 0) {
+      const prevClick = lastSelectClickRef.current;
+      const distFromLastClick = Math.hypot(sx - prevClick.sx, sy - prevClick.sy);
+      const nextCycleIdx =
+        distFromLastClick <= 8 ? (prevClick.cycleIndex + 1) % allHits.length : 0;
+
+      lastSelectClickRef.current = {
+        sx,
+        sy,
+        cycleIndex: nextCycleIdx,
+      };
+
+      const chosen = allHits[nextCycleIdx];
+      if (chosen.kind === 'node') {
+        handleSelectEntity('node', chosen.nodeId);
+      } else if (chosen.kind === 'load') {
+        handleSelectEntity('load', chosen.loadId);
+      } else if (chosen.kind === 'member') {
+        handleSelectEntity('member', chosen.elementId);
       }
     } else {
+      lastSelectClickRef.current = { sx: -9999, sy: -9999, cycleIndex: 0 };
       panDragRef.current = {
         active: true,
         startSx: sx,
         startSy: sy,
-        origPanX: viewport.panX,
-        origPanY: viewport.panY,
+        origPanX: currentVp.panX,
+        origPanY: currentVp.panY,
         moved: false,
       };
     }
@@ -753,6 +912,8 @@ export function App() {
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
+    const currentVp = viewportRef.current;
+    const currentModel = modelRef.current;
 
     if (panDragRef.current.active) {
       const dx = sx - panDragRef.current.startSx;
@@ -768,11 +929,17 @@ export function App() {
       return;
     }
 
-    const currentSnap = computeSmartSnap(sx, sy, viewport, model.nodes, model.elements);
+    const currentSnap = computeSmartSnap(
+      sx,
+      sy,
+      currentVp,
+      currentModel.nodes,
+      currentModel.elements
+    );
     setSnapTarget(currentSnap);
 
     // Interactive Hover Probe along any member
-    const probe = probeMemberAtCursor(sx, sy, viewport, model, solverOutput, 18);
+    const probe = probeMemberAtCursor(sx, sy, currentVp, currentModel, solverOutput, 18);
     setHoverProbe(probe);
     setHoveredElementId(probe ? probe.element.id : null);
   };
@@ -783,11 +950,14 @@ export function App() {
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
+    const currentVp = viewportRef.current;
+    const currentModel = modelRef.current;
+    const currentTool = activeToolRef.current;
 
     if (panDragRef.current.active) {
       const wasMoved = panDragRef.current.moved;
       panDragRef.current.active = false;
-      if (!wasMoved && activeTool === 'select') {
+      if (!wasMoved && currentTool === 'select') {
         setSelectedNodeId(null);
         setSelectedElementId(null);
         setSelectedLoadId(null);
@@ -795,11 +965,18 @@ export function App() {
       return;
     }
 
-    // Support click-drag-release in Draw Member mode!
-    if (activeTool === 'draw_member' && drawStartPoint) {
-      const currentSnap = computeSmartSnap(sx, sy, viewport, model.nodes, model.elements);
-      if (Math.hypot(currentSnap.x - drawStartPoint.x, currentSnap.y - drawStartPoint.y) >= 0.2) {
-        completeDrawMember(drawStartPoint, currentSnap);
+    // Support click-and-drag release in Draw Member mode (when dragged >= 0.1 m away from start)
+    const activeStart = drawStartPointRef.current;
+    if (currentTool === 'draw_member' && activeStart) {
+      const currentSnap = computeSmartSnap(
+        sx,
+        sy,
+        currentVp,
+        currentModel.nodes,
+        currentModel.elements
+      );
+      if (Math.hypot(currentSnap.x - activeStart.x, currentSnap.y - activeStart.y) >= 0.09) {
+        completeDrawMember(activeStart, currentSnap);
         setDrawStartPoint(null);
       }
     }
@@ -832,9 +1009,10 @@ export function App() {
     elementId: string,
     loadType: 'distributed' | 'point'
   ) => {
+    const currentModel = modelRef.current;
     const newLoadId = nextEntityId(
       'L',
-      model.loads.map((l) => l.id)
+      currentModel.loads.map((l) => l.id)
     );
     const newLoad: StructuralLoad =
       loadType === 'distributed'
@@ -861,15 +1039,14 @@ export function App() {
       ...prev,
       loads: [...prev.loads, newLoad],
     }));
-    setSelectedLoadId(newLoadId);
-    setSelectedElementId(null);
-    setSelectedNodeId(null);
+    handleSelectEntity('load', newLoadId);
   };
 
   const handleQuickAddNodalLoad = (nodeId: string) => {
+    const currentModel = modelRef.current;
     const newLoadId = nextEntityId(
       'L',
-      model.loads.map((l) => l.id)
+      currentModel.loads.map((l) => l.id)
     );
     const newLoad: StructuralLoad = {
       id: newLoadId,
@@ -884,12 +1061,10 @@ export function App() {
       ...prev,
       loads: [...prev.loads, newLoad],
     }));
-    setSelectedLoadId(newLoadId);
-    setSelectedNodeId(null);
-    setSelectedElementId(null);
+    handleSelectEntity('load', newLoadId);
   };
 
-  // Pin a parameter to the Real-Time Sensitivity Panel
+  // Pin a parameter to the Real-Time Sensitivity Panel (E, kx, ky, kθ, or Load magnitude)
   const handlePinParameter = (
     kind: PinnedParameterTarget['kind'],
     targetId: string
@@ -900,24 +1075,10 @@ export function App() {
       return;
     }
 
-    if (kind === 'member_depth') {
-      const el = model.elements.find(
-        (e): e is Frame2DElement => e.kind === 'frame2d' && e.id === targetId
-      );
-      if (!el) return;
-      setPinnedParams((prev) => [
-        ...prev,
-        {
-          id: pinId,
-          label: `Member ${el.id} Depth h`,
-          kind: 'member_depth',
-          elementId: el.id,
-          baseValue: el.section.depthMm,
-          multiplier: 1.0,
-        },
-      ]);
-    } else if (kind === 'member_E') {
-      const el = model.elements.find(
+    const currentModel = modelRef.current;
+
+    if (kind === 'member_E') {
+      const el = currentModel.elements.find(
         (e): e is Frame2DElement => e.kind === 'frame2d' && e.id === targetId
       );
       if (!el) return;
@@ -932,8 +1093,31 @@ export function App() {
           multiplier: 1.0,
         },
       ]);
+    } else if (kind === 'node_spring_kx') {
+      const n = currentModel.nodes.find((item) => item.id === targetId);
+      if (!n) return;
+      const baseKx = n.springs.kx > 0 ? n.springs.kx : 25000;
+      if (n.springs.kx === 0) {
+        updateModelWithHistory((prev) => ({
+          ...prev,
+          nodes: prev.nodes.map((nd) =>
+            nd.id === n.id ? { ...nd, springs: { ...nd.springs, kx: baseKx } } : nd
+          ),
+        }));
+      }
+      setPinnedParams((prev) => [
+        ...prev,
+        {
+          id: pinId,
+          label: `Node ${n.id} Spring kx`,
+          kind: 'node_spring_kx',
+          nodeId: n.id,
+          baseValue: baseKx,
+          multiplier: 1.0,
+        },
+      ]);
     } else if (kind === 'node_spring_ky') {
-      const n = model.nodes.find((item) => item.id === targetId);
+      const n = currentModel.nodes.find((item) => item.id === targetId);
       if (!n) return;
       const baseKy = n.springs.ky > 0 ? n.springs.ky : 25000;
       if (n.springs.ky === 0) {
@@ -956,7 +1140,7 @@ export function App() {
         },
       ]);
     } else if (kind === 'node_spring_krz') {
-      const n = model.nodes.find((item) => item.id === targetId);
+      const n = currentModel.nodes.find((item) => item.id === targetId);
       if (!n) return;
       const baseKrz = n.springs.krz > 0 ? n.springs.krz : 15000;
       if (n.springs.krz === 0) {
@@ -979,7 +1163,7 @@ export function App() {
         },
       ]);
     } else if (kind === 'load_magnitude') {
-      const ld = model.loads.find((l) => l.id === targetId);
+      const ld = currentModel.loads.find((l) => l.id === targetId);
       if (!ld) return;
       const basePrimary =
         ld.kind === 'member_distributed'
@@ -1018,25 +1202,10 @@ export function App() {
     );
 
     setModel((prev) => {
-      if (targetPin.kind === 'member_depth') {
-        const nextDepth = Math.max(20, Math.round(targetPin.baseValue * multiplier));
-        return {
-          ...prev,
-          elements: prev.elements.map((el) => {
-            if (el.id !== targetPin.elementId || el.kind !== 'frame2d') return el;
-            const dimKey = el.section.shape === 'circular' ? 'd' : 'h';
-            const nextDims = { ...el.section.dimensions, [dimKey]: nextDepth };
-            return {
-              ...el,
-              section: computeCrossSection(el.section.shape, nextDims),
-            };
-          }),
-        };
-      }
-
+      let next = prev;
       if (targetPin.kind === 'member_E') {
         const nextE = Number(Math.max(1, targetPin.baseValue * multiplier).toFixed(1));
-        return {
+        next = {
           ...prev,
           elements: prev.elements.map((el) =>
             el.id === targetPin.elementId && el.kind === 'frame2d'
@@ -1044,11 +1213,19 @@ export function App() {
               : el
           ),
         };
-      }
-
-      if (targetPin.kind === 'node_spring_ky') {
+      } else if (targetPin.kind === 'node_spring_kx') {
+        const nextKx = Math.round(targetPin.baseValue * multiplier);
+        next = {
+          ...prev,
+          nodes: prev.nodes.map((n) =>
+            n.id === targetPin.nodeId
+              ? { ...n, springs: { ...n.springs, kx: nextKx } }
+              : n
+          ),
+        };
+      } else if (targetPin.kind === 'node_spring_ky') {
         const nextKy = Math.round(targetPin.baseValue * multiplier);
-        return {
+        next = {
           ...prev,
           nodes: prev.nodes.map((n) =>
             n.id === targetPin.nodeId
@@ -1056,11 +1233,9 @@ export function App() {
               : n
           ),
         };
-      }
-
-      if (targetPin.kind === 'node_spring_krz') {
+      } else if (targetPin.kind === 'node_spring_krz') {
         const nextKrz = Math.round(targetPin.baseValue * multiplier);
-        return {
+        next = {
           ...prev,
           nodes: prev.nodes.map((n) =>
             n.id === targetPin.nodeId
@@ -1068,10 +1243,8 @@ export function App() {
               : n
           ),
         };
-      }
-
-      if (targetPin.kind === 'load_magnitude') {
-        return {
+      } else if (targetPin.kind === 'load_magnitude') {
+        next = {
           ...prev,
           loads: prev.loads.map((ld) => {
             if (ld.id !== targetPin.loadId) return ld;
@@ -1100,8 +1273,8 @@ export function App() {
           }),
         };
       }
-
-      return prev;
+      modelRef.current = next;
+      return next;
     });
   };
 
@@ -1113,12 +1286,12 @@ export function App() {
 
   // JSON Export / Import
   const handleExportJson = () => {
-    const json = JSON.stringify(model, null, 2);
+    const json = JSON.stringify(modelRef.current, null, 2);
     const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${model.name.toLowerCase().replace(/\s+/g, '_')}.fem.json`;
+    a.download = `${modelRef.current.name.toLowerCase().replace(/\s+/g, '_')}.fem.json`;
     a.click();
     URL.revokeObjectURL(url);
     showToast('Exported structural model to JSON.');
@@ -1132,7 +1305,7 @@ export function App() {
         return;
       }
       updateModelWithHistory(() => parsed, true);
-      setViewport((vp) => fitModelToViewport(parsed.nodes, vp.width, vp.height, vp));
+      fitNodesToUsableCanvas(parsed.nodes);
       showToast(`Imported "${parsed.name || 'Custom Model'}" successfully.`);
     } catch {
       showToast('Failed to parse JSON file.');
@@ -1140,11 +1313,12 @@ export function App() {
   };
 
   return (
-    <div className="flex flex-col w-screen h-screen bg-slate-950 text-slate-100 overflow-hidden font-sans">
+    <div className="flex flex-col w-screen h-screen bg-slate-50 text-slate-900 overflow-hidden font-sans">
       {/* Top Toolbar */}
       <Toolbar
         activePresetId={activePresetId}
         onSelectPreset={handleSelectPreset}
+        onNewProject={handleNewBlankProject}
         activeTool={activeTool}
         onSelectTool={(t) => {
           setActiveTool(t);
@@ -1162,9 +1336,7 @@ export function App() {
         onZoomOut={() =>
           setViewport((vp) => ({ ...vp, zoom: Math.max(18, vp.zoom / 1.2) }))
         }
-        onFitView={() =>
-          setViewport((vp) => fitModelToViewport(model.nodes, vp.width, vp.height, vp))
-        }
+        onFitView={() => fitNodesToUsableCanvas(modelRef.current.nodes)}
         coordSystem={viewport.coordSystem}
         onToggleCoordSystem={() =>
           setViewport((vp) => ({
@@ -1181,7 +1353,7 @@ export function App() {
         {/* Center Interactive HTML5 Canvas Container */}
         <div
           ref={containerRef}
-          className="relative flex-1 h-full overflow-hidden bg-slate-950"
+          className="relative flex-1 h-full overflow-hidden bg-white"
           onContextMenu={(e: any) => e.preventDefault()}
         >
           {/* Floating Result Overlay Toggles & Hover Probe Callout */}
@@ -1195,12 +1367,12 @@ export function App() {
           {!solverOutput.stable ? (
             <div
               id="unstable-structure-banner"
-              className="absolute top-16 left-3 z-20 max-w-lg bg-rose-950/95 border border-rose-500 text-rose-100 px-3.5 py-2 rounded-lg shadow-2xl text-xs"
+              className="absolute top-16 left-3 z-20 max-w-lg bg-red-50/95 border border-red-300 text-red-900 px-3.5 py-2 rounded-lg shadow-lg text-xs"
             >
-              <div className="font-bold text-rose-300 uppercase tracking-wide mb-0.5">
+              <div className="font-bold text-red-700 uppercase tracking-wide mb-0.5">
                 Unstable Structure — Mechanism or Insufficient Restraints
               </div>
-              <div className="text-rose-200/90 font-mono text-[11px]">
+              <div className="text-red-600 font-mono text-[11px]">
                 {solverOutput.instabilityReason ||
                   'Add supports, springs, or restrain free hinge mechanisms to restore stability.'}
               </div>
@@ -1209,7 +1381,7 @@ export function App() {
 
           {/* Toast Feedback Notification */}
           {toastMessage ? (
-            <div className="absolute top-16 right-4 z-30 bg-slate-900/95 border border-sky-400/60 text-sky-200 px-3 py-1.5 rounded-lg shadow-xl text-xs font-mono">
+            <div className="absolute top-16 right-4 z-30 bg-white/95 border border-blue-300 text-blue-800 px-3 py-1.5 rounded-lg shadow-md text-xs font-mono">
               {toastMessage}
             </div>
           ) : null}
@@ -1229,7 +1401,7 @@ export function App() {
             className={`block select-none ${
               activeTool === 'draw_member'
                 ? 'cursor-crosshair'
-                : activeTool === 'delete'
+                : activeTool === 'delete' || activeTool === 'assign_support'
                   ? 'cursor-pointer'
                   : 'cursor-default'
             }`}
@@ -1251,26 +1423,27 @@ export function App() {
             onPinParameter={handlePinParameter}
             onQuickAddMemberLoad={handleQuickAddMemberLoad}
             onQuickAddNodalLoad={handleQuickAddNodalLoad}
+            onSelectEntity={handleSelectEntity}
           />
 
           {/* Bottom CAD Status & Coordinate HUD Bar */}
-          <div className="absolute bottom-0 inset-x-0 h-7 bg-slate-900/90 backdrop-blur border-t border-slate-800 px-3 flex items-center justify-between text-[11px] font-mono text-slate-400 select-none pointer-events-none">
+          <div className="absolute bottom-0 inset-x-0 h-7 bg-white/95 backdrop-blur border-t border-slate-200 px-3 flex items-center justify-between text-[11px] font-mono text-slate-600 select-none pointer-events-none">
             <div className="flex items-center gap-4">
-              <span className="text-sky-400 font-semibold">
+              <span className="text-blue-700 font-semibold">
                 {snapTarget
                   ? `X: ${snapTarget.x.toFixed(1)} m, Y: ${snapTarget.y.toFixed(1)} m (Z: 0.0 m)`
                   : 'X: 0.0 m, Y: 0.0 m'}
               </span>
-              <span className="hidden sm:inline text-slate-500">|</span>
-              <span className="hidden sm:inline text-slate-300">
+              <span className="hidden sm:inline text-slate-300">|</span>
+              <span className="hidden sm:inline text-slate-600">
                 {activeTool === 'select'
-                  ? 'Click any Member, Node, or Load to edit parameters · Drag background to pan · Scroll to zoom'
+                  ? 'Click any Member, Node, or Load to edit (click repeatedly on busy node to cycle) · Drag background to pan'
                   : activeTool === 'draw_member'
                     ? drawStartPoint
                       ? 'Click or release on end point (snaps to 0.1m grid, existing nodes, or T-splits members)'
-                      : 'Click start point to draw new 1D Frame Member'
+                      : 'Click or drag from start point to draw new 1D Frame Member'
                     : activeTool === 'assign_support'
-                      ? 'Click any node to cycle/edit support restraint (Fixed, Pinned, Roller, Inclined)'
+                      ? 'Click any node (16 px radius) to cycle support: Pinned → Fixed → Roller X → Roller Y → None'
                       : activeTool === 'add_nodal_load'
                         ? 'Click any node to add a concentrated Nodal Load'
                         : activeTool === 'add_member_load'
@@ -1279,7 +1452,7 @@ export function App() {
               </span>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 text-slate-500">
               <span>Nodes: {model.nodes.length}</span>
               <span>Members: {model.elements.length}</span>
               <span>Loads: {model.loads.length}</span>
@@ -1301,20 +1474,20 @@ export function App() {
           }
           onResetPinnedParams={handleResetPinnedParams}
           onAddQuickPin={handlePinParameter}
-          onSelectEntity={(kind, id) => {
-            if (kind === 'node') {
-              setSelectedNodeId(id);
-              setSelectedElementId(null);
-              setSelectedLoadId(null);
-            } else if (kind === 'member') {
-              setSelectedElementId(id);
-              setSelectedNodeId(null);
-              setSelectedLoadId(null);
-            } else {
-              setSelectedLoadId(id);
-              setSelectedNodeId(null);
-              setSelectedElementId(null);
-            }
+          onSelectEntity={handleSelectEntity}
+          onCollapseChange={() => {
+            setTimeout(() => {
+              const el = containerRef.current;
+              if (!el) return;
+              const rect = el.getBoundingClientRect();
+              if (rect.width > 0 && rect.height > 0) {
+                setViewport((vp) => ({
+                  ...vp,
+                  width: rect.width,
+                  height: rect.height,
+                }));
+              }
+            }, 0);
           }}
         />
       </main>
