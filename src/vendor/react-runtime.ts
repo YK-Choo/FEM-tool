@@ -245,7 +245,9 @@ function applyProps(
   isSvg: boolean
 ) {
   const prevListeners: Record<string, any> = (dom as any).__listeners || {};
+  const handlersMap: Record<string, any> = (dom as any).__handlers || {};
   (dom as any).__listeners = prevListeners;
+  (dom as any).__handlers = handlersMap;
 
   for (const k of Object.keys(prevProps)) {
     if (k === 'children' || k === 'ref') continue;
@@ -261,6 +263,7 @@ function applyProps(
             : rawName === 'doubleclick'
               ? 'dblclick'
               : rawName;
+        delete handlersMap[evtName];
         if (prevListeners[evtName]) {
           dom.removeEventListener(evtName, prevListeners[evtName]);
           delete prevListeners[evtName];
@@ -298,12 +301,14 @@ function applyProps(
             ? 'dblclick'
             : rawName;
 
-      if (prevListeners[evtName] !== val) {
-        if (prevListeners[evtName]) {
-          dom.removeEventListener(evtName, prevListeners[evtName]);
-        }
-        prevListeners[evtName] = val;
-        dom.addEventListener(evtName, val);
+      handlersMap[evtName] = val;
+      if (!prevListeners[evtName]) {
+        const stableWrapper = (evt: Event) => {
+          const fn = (dom as any).__handlers?.[evtName];
+          if (typeof fn === 'function') fn(evt);
+        };
+        prevListeners[evtName] = stableWrapper;
+        dom.addEventListener(evtName, stableWrapper);
       }
       continue;
     }

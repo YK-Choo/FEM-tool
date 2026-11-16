@@ -242,3 +242,14 @@ export const FolderOpen = createLucideIcon([
   },
 ]);
 
+export const PlusCircle = createLucideIcon([
+  { tag: 'circle', attrs: { cx: '12', cy: '12', r: '10' } },
+  { tag: 'line', attrs: { x1: '12', y1: '8', x2: '12', y2: '16' } },
+  { tag: 'line', attrs: { x1: '8', y1: '12', x2: '16', y2: '12' } },
+]);
+
+export const Dot = createLucideIcon([
+  { tag: 'circle', attrs: { cx: '12.1', cy: '12.1', r: '1' } },
+]);
+
+

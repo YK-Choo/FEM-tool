@@ -21,10 +21,12 @@ import {
   AlertTriangle,
   CheckCircle2,
   Boxes,
+  PlusCircle,
 } from '../vendor/lucide-react.tsx';
 
 export type ActiveToolMode =
   | 'select'
+  | 'add_node'
   | 'draw_member'
   | 'assign_support'
   | 'add_nodal_load'
@@ -80,6 +82,7 @@ export function Toolbar({
     icon: any;
   }> = [
     { id: 'select', label: 'Select / Inspect', shortcut: 'V', icon: MousePointer },
+    { id: 'add_node', label: 'Add Node', shortcut: 'A', icon: PlusCircle },
     { id: 'draw_member', label: 'Draw Member', shortcut: 'M', icon: PenTool },
     { id: 'assign_support', label: 'Assign Support', shortcut: 'S', icon: Anchor },
     { id: 'add_nodal_load', label: 'Nodal Load', shortcut: 'N', icon: ArrowDownToDot },

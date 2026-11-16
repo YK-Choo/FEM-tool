@@ -3,11 +3,16 @@ import type {
   StructuralNode,
   Frame2DElement,
   StructuralLoad,
+  SupportPreset,
   SolverOutput,
   ElementSamplePoint,
 } from '../types/model.ts';
-import { worldToScreen, type ViewportTransform } from './coordinates.ts';
-import { restraintsFromSupportPreset } from '../solver/sections.ts';
+import { worldToScreen, type ViewportTransform, type SnapResult } from './coordinates.ts';
+import {
+  computeCrossSection,
+  createMaterialFromPreset,
+  restraintsFromSupportPreset,
+} from '../solver/sections.ts';
 
 export interface HoverProbeData {
   element: Frame2DElement;
@@ -200,6 +205,192 @@ export function canAddMember(
     }
   }
   return { valid: true };
+}
+
+/**
+ * Add or resolve a StructuralNode at the given SnapResult:
+ * - If snap hits an existing node or a node already exists within 0.04 m of (snap.x, snap.y),
+ *   returns that existing nodeId without creating a duplicate (`created: false`).
+ * - If snap hits an existing member segment (or if (snap.x, snap.y) lies strictly mid-span on an
+ *   existing member), inserts a new StructuralNode and calls `splitMemberAtPoint` to split the
+ *   member into two connected sub-members sharing that node while preserving section/material
+ *   properties and splitting attached loads accurately (`created: true`, `splitElementId`).
+ * - Otherwise creates and appends a new standalone StructuralNode (`z = 0`) at (snap.x, snap.y).
+ */
+export function addNodeAtSnap(
+  model: StructuralModel,
+  snap: Pick<SnapResult, 'x' | 'y' | 'kind' | 'nodeId' | 'splitElementId'>
+): {
+  model: StructuralModel;
+  nodeId: string;
+  created: boolean;
+  splitElementId?: string;
+} {
+  // 1. Existing node by ID
+  if (snap.kind === 'node' && snap.nodeId) {
+    const found = model.nodes.find((n) => n.id === snap.nodeId);
+    if (found) {
+      return { model, nodeId: found.id, created: false };
+    }
+  }
+
+  // 2. Existing node at exact/nearby coordinates (prevent duplicate nodes)
+  const existingCoordNode = model.nodes.find(
+    (n) => Math.hypot(n.x - snap.x, n.y - snap.y) < 0.04
+  );
+  if (existingCoordNode) {
+    return { model, nodeId: existingCoordNode.id, created: false };
+  }
+
+  // 3. Member segment split (either explicitly flagged by snap.splitElementId or lying mid-span on a member)
+  let targetSplitElementId: string | undefined =
+    snap.kind === 'member_segment' ? snap.splitElementId : undefined;
+
+  if (!targetSplitElementId || !model.elements.some((e) => e.id === targetSplitElementId)) {
+    targetSplitElementId = undefined;
+    const nodeMap = new Map(model.nodes.map((n) => [n.id, n]));
+    for (const el of model.elements) {
+      if (el.kind !== 'frame2d') continue;
+      const ni = nodeMap.get(el.nodeI);
+      const nj = nodeMap.get(el.nodeJ);
+      if (!ni || !nj) continue;
+      const dx = nj.x - ni.x;
+      const dy = nj.y - ni.y;
+      const lenSq = dx * dx + dy * dy;
+      if (lenSq < 1e-8) continue;
+      const t = ((snap.x - ni.x) * dx + (snap.y - ni.y) * dy) / lenSq;
+      if (t > 0.02 && t < 0.98) {
+        const projX = ni.x + t * dx;
+        const projY = ni.y + t * dy;
+        if (Math.hypot(snap.x - projX, snap.y - projY) < 0.04) {
+          targetSplitElementId = el.id;
+          break;
+        }
+      }
+    }
+  }
+
+  if (targetSplitElementId) {
+    const splitRes = splitMemberAtPoint(model, targetSplitElementId, snap.x, snap.y);
+    return {
+      model: splitRes.model,
+      nodeId: splitRes.newNodeId,
+      created: true,
+      splitElementId: targetSplitElementId,
+    };
+  }
+
+  // 4. Standalone node on the 0.1 m Cartesian grid
+  const newNodeId = nextEntityId(
+    'N',
+    model.nodes.map((n) => n.id)
+  );
+  const newNode: StructuralNode = {
+    id: newNodeId,
+    label: newNodeId,
+    x: Number(snap.x.toFixed(4)),
+    y: Number(snap.y.toFixed(4)),
+    z: 0,
+    support: 'none',
+    restraints: restraintsFromSupportPreset('none'),
+    springs: { kx: 0, ky: 0, kz: 0, krx: 0, kry: 0, krz: 0 },
+  };
+
+  return {
+    model: {
+      ...model,
+      nodes: [...model.nodes, newNode],
+    },
+    nodeId: newNodeId,
+    created: true,
+  };
+}
+
+/**
+ * Append a new Frame2DElement connecting `startNodeId` and `endNodeId` with default
+ * IPE 360 Steel section/material properties after validating with `canAddMember`.
+ */
+export function addMemberBetweenNodes(
+  model: StructuralModel,
+  startNodeId: string,
+  endNodeId: string
+): {
+  model: StructuralModel;
+  elementId: string | null;
+  reason?: string;
+} {
+  const check = canAddMember(model, startNodeId, endNodeId);
+  if (!check.valid) {
+    return { model, elementId: null, reason: check.reason };
+  }
+
+  const newElId = nextEntityId(
+    'M',
+    model.elements.map((e) => e.id)
+  );
+  const defaultSec = computeCrossSection('i_section', {
+    h: 360,
+    b: 170,
+    tw: 8.0,
+    tf: 12.7,
+  });
+  const defaultMat = createMaterialFromPreset('steel');
+
+  const newEl: Frame2DElement = {
+    id: newElId,
+    kind: 'frame2d',
+    label: `Member ${newElId}`,
+    nodeI: startNodeId,
+    nodeJ: endNodeId,
+    section: defaultSec,
+    material: defaultMat,
+    releaseStart: false,
+    releaseEnd: false,
+  };
+
+  return {
+    model: {
+      ...model,
+      elements: [...model.elements, newEl],
+    },
+    elementId: newElId,
+  };
+}
+
+/**
+ * Cycle a node's support restraint (`pinned` -> `fixed` -> `rollerX` -> `rollerY` -> `none`)
+ * or apply `explicitSupport` if provided, updating its 3D DOF restraints.
+ */
+export function cycleNodeSupport(
+  model: StructuralModel,
+  nodeId: string,
+  explicitSupport?: SupportPreset
+): { model: StructuralModel; nextSupport: SupportPreset } {
+  const order: SupportPreset[] = ['pinned', 'fixed', 'rollerX', 'rollerY', 'none'];
+  let assigned: SupportPreset = explicitSupport ?? 'pinned';
+
+  const nextNodes = model.nodes.map((n) => {
+    if (n.id !== nodeId) return n;
+    if (explicitSupport) {
+      assigned = explicitSupport;
+    } else {
+      const curIdx = order.indexOf(n.support);
+      assigned = order[(curIdx + 1) % order.length];
+    }
+    return {
+      ...n,
+      support: assigned,
+      restraints: restraintsFromSupportPreset(assigned),
+    };
+  });
+
+  return {
+    model: {
+      ...model,
+      nodes: nextNodes,
+    },
+    nextSupport: assigned,
+  };
 }
 
 /**
