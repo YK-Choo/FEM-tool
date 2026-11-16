@@ -219,3 +219,26 @@ export const Gauge = createLucideIcon([
   { tag: 'path', attrs: { d: 'm12 14 4-4' } },
   { tag: 'path', attrs: { d: 'M3.34 19a10 10 0 1 1 17.32 0' } },
 ]);
+
+export const FilePlus = createLucideIcon([
+  { tag: 'path', attrs: { d: 'M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z' } },
+  { tag: 'polyline', attrs: { points: '14 2 14 8 20 8' } },
+  { tag: 'line', attrs: { x1: '12', y1: '18', x2: '12', y2: '12' } },
+  { tag: 'line', attrs: { x1: '9', y1: '15', x2: '15', y2: '15' } },
+]);
+
+export const PlusSquare = createLucideIcon([
+  { tag: 'rect', attrs: { width: '18', height: '18', x: '3', y: '3', rx: '2' } },
+  { tag: 'line', attrs: { x1: '12', y1: '8', x2: '12', y2: '16' } },
+  { tag: 'line', attrs: { x1: '8', y1: '12', x2: '16', y2: '12' } },
+]);
+
+export const FolderOpen = createLucideIcon([
+  {
+    tag: 'path',
+    attrs: {
+      d: 'm6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2',
+    },
+  },
+]);
+

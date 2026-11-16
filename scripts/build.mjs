@@ -158,7 +158,7 @@ ${moduleChunks.join('\n\n')}
 
 export function generateStandaloneHtml(bundleCode) {
   return `<!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -173,23 +173,23 @@ export function generateStandaloneHtml(bundleCode) {
       width: 100%;
       height: 100%;
       overflow: hidden;
-      background-color: #020617;
-      color: #f1f5f9;
+      background-color: #f8fafc;
+      color: #0f172a;
       font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       -webkit-font-smoothing: antialiased;
     }
     /* Custom Scrollbar for Dockable Panels */
     ::-webkit-scrollbar { width: 6px; height: 6px; }
-    ::-webkit-scrollbar-track { background: #0f172a; }
-    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+    ::-webkit-scrollbar-track { background: #f1f5f9; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
     input[type="number"]::-webkit-inner-spin-button,
     input[type="number"]::-webkit-outer-spin-button {
       opacity: 1;
     }
   </style>
 </head>
-<body class="bg-slate-950 text-slate-100 antialiased selection:bg-sky-500/30 selection:text-sky-200">
+<body class="bg-slate-50 text-slate-900 antialiased selection:bg-blue-500/20 selection:text-blue-900">
   <div id="root"></div>
   <script>
 ${bundleCode}

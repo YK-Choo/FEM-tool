@@ -203,68 +203,171 @@ export function canAddMember(
 }
 
 /**
- * Hit-test the canvas in priority order:
- * 1. Load handles / arrows / labels (so clicking any Load opens the Load editor pop-up)
- * 2. Nodes (so clicking any Node opens the Node editor pop-up)
- * 3. Members (so clicking any Member opens the Member editor pop-up)
+ * Find the closest StructuralNode within radiusPx (default 16 px) in screen space.
+ * Used by Assign Support and Add Nodal Load tools so clicking near a node reliably hits it
+ * even if load arrows or member lines overlap the node.
  */
-export function hitTestCanvas(
+export function findNodeWithinRadius(
+  sx: number,
+  sy: number,
+  vp: ViewportTransform,
+  nodes: StructuralNode[],
+  radiusPx: number = 16
+): { node: StructuralNode; screenX: number; screenY: number; distancePx: number } | null {
+  let bestNode: StructuralNode | null = null;
+  let bestDist = radiusPx;
+  let bestSc = { sx: 0, sy: 0 };
+
+  for (const n of nodes) {
+    const sc = worldToScreen(n, vp);
+    const d = Math.hypot(sx - sc.sx, sy - sc.sy);
+    if (d <= bestDist) {
+      bestDist = d;
+      bestNode = n;
+      bestSc = sc;
+    }
+  }
+
+  if (!bestNode) return null;
+  return {
+    node: bestNode,
+    screenX: bestSc.sx,
+    screenY: bestSc.sy,
+    distancePx: bestDist,
+  };
+}
+
+/**
+ * Return all overlapping entities at (sx, sy) in deterministic click-through cycling order:
+ *   Node -> Nodal Load #1 -> Nodal Load #2 (etc.) -> Connected Member(s) -> (cycles back to Node)
+ * Also includes any non-nodal Load handle or Member segment directly under the cursor.
+ */
+export function hitTestAllCanvasEntities(
   sx: number,
   sy: number,
   vp: ViewportTransform,
   model: StructuralModel,
   loadHandles: Array<{ loadId: string; sx: number; sy: number }>
-): CanvasHitTarget | null {
+): CanvasHitTarget[] {
+  const targets: CanvasHitTarget[] = [];
+  const addedLoadIds = new Set<string>();
+  const addedMemberIds = new Set<string>();
+
   const nodeMap = new Map<string, StructuralNode>();
   for (const n of model.nodes) nodeMap.set(n.id, n);
 
-  // 1. Check Load interactive handles first (within 15px)
-  let bestLoad: { loadId: string; sx: number; sy: number } | null = null;
-  let bestLoadDist = 15;
+  // 1. Check if cursor is over a Node (within 16 px)
+  const nodeHit = findNodeWithinRadius(sx, sy, vp, model.nodes, 16);
+  if (nodeHit) {
+    const n = nodeHit.node;
+    targets.push({
+      kind: 'node',
+      nodeId: n.id,
+      screenX: nodeHit.screenX,
+      screenY: nodeHit.screenY,
+    });
+
+    // All Nodal Loads attached to this node (in model order)
+    for (const ld of model.loads) {
+      if (ld.kind === 'nodal' && ld.nodeId === n.id) {
+        addedLoadIds.add(ld.id);
+        targets.push({
+          kind: 'load',
+          loadId: ld.id,
+          screenX: nodeHit.screenX,
+          screenY: nodeHit.screenY,
+        });
+      }
+    }
+
+    // Also any load handle within 16 px of the click
+    for (const lh of loadHandles) {
+      if (!addedLoadIds.has(lh.loadId) && Math.hypot(sx - lh.sx, sy - lh.sy) <= 16) {
+        addedLoadIds.add(lh.loadId);
+        targets.push({
+          kind: 'load',
+          loadId: lh.loadId,
+          screenX: lh.sx,
+          screenY: lh.sy,
+        });
+      }
+    }
+
+    // All Connected Members attached to this node
+    for (const el of model.elements) {
+      if (el.kind === 'frame2d' && (el.nodeI === n.id || el.nodeJ === n.id)) {
+        addedMemberIds.add(el.id);
+        targets.push({
+          kind: 'member',
+          elementId: el.id,
+          screenX: nodeHit.screenX,
+          screenY: nodeHit.screenY,
+        });
+      }
+    }
+
+    return targets;
+  }
+
+  // 2. Not on a node: check Load interactive handles (within 16 px)
+  const matchingLoads: Array<{ loadId: string; sx: number; sy: number; dist: number }> = [];
   for (const lh of loadHandles) {
     const d = Math.hypot(sx - lh.sx, sy - lh.sy);
-    if (d <= bestLoadDist) {
-      bestLoadDist = d;
-      bestLoad = lh;
+    if (d <= 16 && !addedLoadIds.has(lh.loadId)) {
+      addedLoadIds.add(lh.loadId);
+      matchingLoads.push({ ...lh, dist: d });
     }
   }
-  if (bestLoad) {
-    return {
+  matchingLoads.sort((a, b) => a.dist - b.dist);
+  for (const ml of matchingLoads) {
+    // If this load handle belongs to a NodalLoad, also include its parent Node and sibling NodalLoads for easy cycling!
+    const ldObj = model.loads.find((l) => l.id === ml.loadId);
+    if (ldObj && ldObj.kind === 'nodal') {
+      const parentNode = nodeMap.get(ldObj.nodeId);
+      if (parentNode && !targets.some((t) => t.kind === 'node' && t.nodeId === parentNode.id)) {
+        const nSc = worldToScreen(parentNode, vp);
+        targets.push({
+          kind: 'node',
+          nodeId: parentNode.id,
+          screenX: nSc.sx,
+          screenY: nSc.sy,
+        });
+        for (const sib of model.loads) {
+          if (sib.kind === 'nodal' && sib.nodeId === parentNode.id) {
+            addedLoadIds.add(sib.id);
+            targets.push({
+              kind: 'load',
+              loadId: sib.id,
+              screenX: nSc.sx,
+              screenY: nSc.sy,
+            });
+          }
+        }
+        for (const el of model.elements) {
+          if (el.kind === 'frame2d' && (el.nodeI === parentNode.id || el.nodeJ === parentNode.id)) {
+            addedMemberIds.add(el.id);
+            targets.push({
+              kind: 'member',
+              elementId: el.id,
+              screenX: nSc.sx,
+              screenY: nSc.sy,
+            });
+          }
+        }
+        continue;
+      }
+    }
+    targets.push({
       kind: 'load',
-      loadId: bestLoad.loadId,
-      screenX: bestLoad.sx,
-      screenY: bestLoad.sy,
-    };
+      loadId: ml.loadId,
+      screenX: ml.sx,
+      screenY: ml.sy,
+    });
   }
 
-  // 2. Check Nodes (within 14px)
-  let bestNode: StructuralNode | null = null;
-  let bestNodeDist = 14;
-  let bestNodeScreen = { sx: 0, sy: 0 };
-  for (const n of model.nodes) {
-    const sc = worldToScreen(n, vp);
-    const d = Math.hypot(sx - sc.sx, sy - sc.sy);
-    if (d <= bestNodeDist) {
-      bestNodeDist = d;
-      bestNode = n;
-      bestNodeScreen = sc;
-    }
-  }
-  if (bestNode) {
-    return {
-      kind: 'node',
-      nodeId: bestNode.id,
-      screenX: bestNodeScreen.sx,
-      screenY: bestNodeScreen.sy,
-    };
-  }
-
-  // 3. Check Members (within 10px of segment)
-  let bestEl: Frame2DElement | null = null;
-  let bestElDist = 10;
-  let bestElProj = { sx: 0, sy: 0 };
+  // 3. Check Member segments (within 12 px)
   for (const el of model.elements) {
-    if (el.kind !== 'frame2d') continue;
+    if (el.kind !== 'frame2d' || addedMemberIds.has(el.id)) continue;
     const ni = nodeMap.get(el.nodeI);
     const nj = nodeMap.get(el.nodeJ);
     if (!ni || !nj) continue;
@@ -278,24 +381,34 @@ export function hitTestCanvas(
     const px = si.sx + t * dx;
     const py = si.sy + t * dy;
     const d = Math.hypot(sx - px, sy - py);
-    if (d <= bestElDist) {
-      bestElDist = d;
-      bestEl = el;
-      bestElProj = { sx: px, sy: py };
+    if (d <= 12) {
+      addedMemberIds.add(el.id);
+      targets.push({
+        kind: 'member',
+        elementId: el.id,
+        screenX: px,
+        screenY: py,
+      });
     }
   }
 
-  if (bestEl) {
-    return {
-      kind: 'member',
-      elementId: bestEl.id,
-      screenX: bestElProj.sx,
-      screenY: bestElProj.sy,
-    };
-  }
-
-  return null;
+  return targets;
 }
+
+/**
+ * Hit-test the canvas for a single primary target.
+ */
+export function hitTestCanvas(
+  sx: number,
+  sy: number,
+  vp: ViewportTransform,
+  model: StructuralModel,
+  loadHandles: Array<{ loadId: string; sx: number; sy: number }>
+): CanvasHitTarget | null {
+  const all = hitTestAllCanvasEntities(sx, sy, vp, model, loadHandles);
+  return all.length > 0 ? all[0] : null;
+}
+
 
 /**
  * Interactive Hover Probe:

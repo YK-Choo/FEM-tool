@@ -243,7 +243,12 @@ export function computeSmartSnap(
 }
 
 /**
- * Compute a balanced ViewportTransform that centers and fits the structural model.
+ * Compute a balanced ViewportTransform that centers and fits the structural model
+ * inside the usable canvas area (after subtracting toolbar and right sensitivity panel).
+ * - If nodes is empty (0 nodes), resets the view cleanly to show x in [-1 m, 10 m], y in [-2 m, 6 m].
+ * - Enforces a minimum span of 2.0 m on both X and Y so degenerate single-line structures
+ *   (purely horizontal beams where maxY === minY or vertical columns where maxX === minX)
+ *   never produce Infinity or NaN scale.
  */
 export function fitModelToViewport(
   nodes: StructuralNode[],
@@ -251,50 +256,80 @@ export function fitModelToViewport(
   height: number,
   current?: Partial<ViewportTransform>
 ): ViewportTransform {
+  const safeW = Math.max(width, 320);
+  const safeH = Math.max(height, 240);
+
   const base: ViewportTransform = {
-    panX: width * 0.25,
-    panY: height * 0.65,
+    panX: safeW * 0.25,
+    panY: safeH * 0.65,
     zoom: 70,
-    width,
-    height,
+    width: safeW,
+    height: safeH,
     coordSystem: current?.coordSystem ?? 'cartesian',
     polarOrigin: current?.polarOrigin ?? { x: 0, y: 0 },
   };
 
-  if (nodes.length === 0 || width <= 0 || height <= 0) {
-    return base;
+  let minX = -1;
+  let maxX = 10;
+  let minY = -2;
+  let maxY = 6;
+
+  if (nodes.length > 0) {
+    minX = Infinity;
+    maxX = -Infinity;
+    minY = Infinity;
+    maxY = -Infinity;
+
+    for (const n of nodes) {
+      if (Number.isFinite(n.x)) {
+        if (n.x < minX) minX = n.x;
+        if (n.x > maxX) maxX = n.x;
+      }
+      if (Number.isFinite(n.y)) {
+        if (n.y < minY) minY = n.y;
+        if (n.y > maxY) maxY = n.y;
+      }
+    }
+
+    if (!Number.isFinite(minX) || !Number.isFinite(maxX)) {
+      minX = -1;
+      maxX = 10;
+    }
+    if (!Number.isFinite(minY) || !Number.isFinite(maxY)) {
+      minY = -2;
+      maxY = 6;
+    }
   }
 
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
+  // Enforce minimum span of 2.0 m so horizontal beams (maxY === minY) or vertical columns
+  // (maxX === minX) never produce Infinity or NaN zoom.
+  const spanX = Math.max(maxX - minX, 2.0);
+  const spanY = Math.max(maxY - minY, 2.0);
 
-  for (const n of nodes) {
-    if (n.x < minX) minX = n.x;
-    if (n.x > maxX) maxX = n.x;
-    if (n.y < minY) minY = n.y;
-    if (n.y > maxY) maxY = n.y;
-  }
+  // Account for floating layer toggle bar at top (~56px) and bottom status bar (~36px)
+  // plus comfortable margin around support symbols and load arrows.
+  const padX = Math.min(160, safeW * 0.22);
+  const padY = Math.min(170, safeH * 0.28);
+  const usableW = Math.max(safeW - padX, safeW * 0.65);
+  const usableH = Math.max(safeH - padY, safeH * 0.60);
 
-  const spanX = Math.max(maxX - minX, 3.0);
-  const spanY = Math.max(maxY - minY, 2.5);
-
-  const usableW = Math.max(width - 240, width * 0.62);
-  const usableH = Math.max(height - 220, height * 0.58);
-
-  const zoom = Math.min(
-    180,
-    Math.max(24, Math.min(usableW / spanX, usableH / spanY))
-  );
+  const rawZoom = Math.min(usableW / spanX, usableH / spanY);
+  const zoom = Number.isFinite(rawZoom)
+    ? Math.min(180, Math.max(24, rawZoom))
+    : 70;
 
   const centerX = (minX + maxX) * 0.5;
   const centerY = (minY + maxY) * 0.5;
 
+  // Vertical center slightly shifted down by 10px to clear the top floating overlay bar
+  const visualCenterX = safeW * 0.5;
+  const visualCenterY = safeH * 0.52;
+
   return {
     ...base,
     zoom,
-    panX: width * 0.5 - centerX * zoom,
-    panY: height * 0.54 + centerY * zoom,
+    panX: visualCenterX - centerX * zoom,
+    panY: visualCenterY + centerY * zoom,
   };
 }
+

@@ -6,7 +6,7 @@ import type {
   Frame2DElement,
 } from '../types/model.ts';
 import type { RenderLayerOptions } from '../renderer/CanvasRenderer.ts';
-import { Sliders, Gauge, RotateCcw, X, Plus, Pin, Activity } from '../vendor/lucide-react.tsx';
+import { Sliders, Gauge, RotateCcw, X, Pin, Activity } from '../vendor/lucide-react.tsx';
 
 export interface SensitivityPanelProps {
   model: StructuralModel;
@@ -22,6 +22,7 @@ export interface SensitivityPanelProps {
     targetId: string
   ) => void;
   onSelectEntity: (kind: 'node' | 'member' | 'load', id: string) => void;
+  onCollapseChange?: (collapsed: boolean) => void;
 }
 
 export function SensitivityPanel({
@@ -35,17 +36,25 @@ export function SensitivityPanel({
   onResetPinnedParams,
   onAddQuickPin,
   onSelectEntity,
+  onCollapseChange,
 }: SensitivityPanelProps) {
   const [Collapsed, setCollapsed] = React.useState<boolean>(false);
   const [quickPinSelect, setQuickPinSelect] = React.useState<string>('');
+
+  const toggleCollapse = (next: boolean) => {
+    setCollapsed(next);
+    if (onCollapseChange) {
+      setTimeout(() => onCollapseChange(next), 0);
+    }
+  };
 
   if (Collapsed) {
     return (
       <button
         id="btn-expand-sensitivity-panel"
         type="button"
-        onClick={() => setCollapsed(false)}
-        className="absolute top-3 right-3 z-20 flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/95 border border-sky-500/40 text-sky-300 text-xs font-semibold shadow-xl cursor-pointer hover:bg-slate-800"
+        onClick={() => toggleCollapse(false)}
+        className="absolute top-3 right-3 z-20 flex items-center gap-2 px-3 py-2 rounded-lg bg-white/95 border border-slate-300 text-blue-700 text-xs font-semibold shadow-lg cursor-pointer hover:bg-slate-50"
       >
         <Sliders size={14} />
         <span>Sensitivity & Telemetry</span>
@@ -56,12 +65,12 @@ export function SensitivityPanel({
   const maxEtaPct = Math.min(999, solverOutput.globalMaxUtilization * 100);
   const etaBarColor =
     solverOutput.globalMaxUtilization > 1.0
-      ? 'bg-rose-500'
+      ? 'bg-red-600'
       : solverOutput.globalMaxUtilization > 0.7
-        ? 'bg-amber-400'
-        : 'bg-emerald-400';
+        ? 'bg-amber-500'
+        : 'bg-emerald-600';
 
-  // Build available quick-pin options from active model
+  // Build available quick-pin options from active model (E, kx, ky, krz, and load magnitudes)
   const quickPinOptions: Array<{ value: string; label: string }> = [];
   for (const ld of model.loads) {
     quickPinOptions.push({
@@ -72,16 +81,18 @@ export function SensitivityPanel({
   for (const el of model.elements) {
     if (el.kind === 'frame2d') {
       quickPinOptions.push({
-        value: `member_depth:${el.id}`,
-        label: `Member ${el.id} Depth h (${el.section.depthMm} mm)`,
-      });
-      quickPinOptions.push({
         value: `member_E:${el.id}`,
         label: `Member ${el.id} Modulus E (${el.material.E} GPa)`,
       });
     }
   }
   for (const n of model.nodes) {
+    if (n.springs.kx > 0) {
+      quickPinOptions.push({
+        value: `node_spring_kx:${n.id}`,
+        label: `Node ${n.id} Spring kx (${n.springs.kx} kN/m)`,
+      });
+    }
     if (n.springs.ky > 0) {
       quickPinOptions.push({
         value: `node_spring_ky:${n.id}`,
@@ -106,13 +117,10 @@ export function SensitivityPanel({
   };
 
   const formatCurrentPinValue = (pin: PinnedParameterTarget): string => {
-    if (pin.kind === 'member_depth') {
-      return `${Math.round(pin.baseValue * pin.multiplier)} mm`;
-    }
     if (pin.kind === 'member_E') {
       return `${(pin.baseValue * pin.multiplier).toFixed(1)} GPa`;
     }
-    if (pin.kind === 'node_spring_ky') {
+    if (pin.kind === 'node_spring_kx' || pin.kind === 'node_spring_ky') {
       return `${Math.round(pin.baseValue * pin.multiplier)} kN/m`;
     }
     if (pin.kind === 'node_spring_krz') {
@@ -132,32 +140,32 @@ export function SensitivityPanel({
   return (
     <aside
       id="realtime-sensitivity-panel"
-      className="w-80 shrink-0 bg-slate-900/95 border-l border-slate-800 flex flex-col h-full overflow-y-auto select-none z-10 text-slate-100"
+      className="w-80 shrink-0 bg-white border-l border-slate-200 flex flex-col h-full overflow-y-auto select-none z-10 text-slate-900 shadow-xs"
     >
       {/* Panel Title Bar */}
-      <div className="flex items-center justify-between px-3.5 py-2.5 border-b border-slate-800 bg-slate-950/50">
+      <div className="flex items-center justify-between px-3.5 py-2.5 border-b border-slate-200 bg-slate-50">
         <div className="flex items-center gap-2">
-          <Sliders size={15} className="text-sky-400" />
-          <h2 className="text-xs font-bold uppercase tracking-wider text-slate-200">
+          <Sliders size={15} className="text-blue-600" />
+          <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800">
             Real-Time Sensitivity
           </h2>
         </div>
         <button
           type="button"
-          onClick={() => setCollapsed(true)}
+          onClick={() => toggleCollapse(true)}
           title="Collapse Panel"
-          className="p-1 rounded text-slate-400 hover:text-slate-100 hover:bg-slate-800 cursor-pointer"
+          className="p-1 rounded text-slate-500 hover:text-slate-900 hover:bg-slate-200/70 cursor-pointer"
         >
           <X size={14} />
         </button>
       </div>
 
       {/* Section 1: Visual Scale Sliders (Deflection Exaggeration & Diagram Scale) */}
-      <div className="p-3.5 border-b border-slate-800 space-y-3">
+      <div className="p-3.5 border-b border-slate-200 space-y-3">
         <div>
           <div className="flex items-center justify-between text-xs mb-1">
-            <span className="text-slate-300 font-medium">Deflection Scale</span>
-            <span className="font-mono text-sky-300 font-semibold">
+            <span className="text-slate-700 font-medium">Deflection Scale</span>
+            <span className="font-mono text-blue-700 font-semibold">
               {layers.deflectionScale}×
             </span>
           </div>
@@ -171,7 +179,7 @@ export function SensitivityPanel({
             onChange={(e: any) =>
               onUpdateLayers({ deflectionScale: Number(e.target.value) })
             }
-            className="w-full accent-sky-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+            className="w-full accent-blue-600 cursor-pointer h-1.5 bg-slate-200 rounded-lg"
           />
           <div className="flex justify-between text-[10px] font-mono text-slate-500 mt-0.5">
             <span>1× (True)</span>
@@ -182,8 +190,8 @@ export function SensitivityPanel({
 
         <div>
           <div className="flex items-center justify-between text-xs mb-1">
-            <span className="text-slate-300 font-medium">N / V / M Diagram Scale</span>
-            <span className="font-mono text-rose-300 font-semibold">
+            <span className="text-slate-700 font-medium">N / V / M Diagram Scale</span>
+            <span className="font-mono text-red-600 font-semibold">
               {layers.diagramScale.toFixed(1)}×
             </span>
           </div>
@@ -197,17 +205,17 @@ export function SensitivityPanel({
             onChange={(e: any) =>
               onUpdateLayers({ diagramScale: Number(e.target.value) })
             }
-            className="w-full accent-rose-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+            className="w-full accent-red-600 cursor-pointer h-1.5 bg-slate-200 rounded-lg"
           />
         </div>
       </div>
 
       {/* Section 2: Live Parametric Sensitivity Sliders */}
-      <div className="p-3.5 border-b border-slate-800 space-y-2.5">
+      <div className="p-3.5 border-b border-slate-200 space-y-2.5">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-1.5">
-            <Pin size={13} className="text-amber-400" />
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+            <Pin size={13} className="text-amber-600" />
+            <span className="text-xs font-bold uppercase tracking-wider text-slate-800">
               Parametric Sliders
             </span>
           </div>
@@ -216,15 +224,15 @@ export function SensitivityPanel({
             type="button"
             onClick={onResetPinnedParams}
             title="Reset all pinned multipliers to 1.0x"
-            className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 cursor-pointer"
+            className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 cursor-pointer"
           >
             <RotateCcw size={11} />
             <span>1.0× Reset</span>
           </button>
         </div>
 
-        <p className="text-[11px] text-slate-400 leading-snug">
-          Drag any slider below to morph section stiffness, soil/joint springs, or loads at 60fps:
+        <p className="text-[11px] text-slate-600 leading-snug">
+          Drag any slider below to morph Young&apos;s modulus E, soil/joint springs, or loads at 60fps:
         </p>
 
         {/* Pinned Sliders List */}
@@ -232,21 +240,21 @@ export function SensitivityPanel({
           {pinnedParams.map((pin) => (
             <div
               key={pin.id}
-              className="bg-slate-950/80 border border-slate-800/90 rounded-lg p-2.5 space-y-1.5"
+              className="bg-slate-50 border border-slate-200 rounded-lg p-2.5 space-y-1.5"
             >
               <div className="flex items-center justify-between gap-1">
-                <span className="text-xs font-semibold text-slate-200 truncate">
+                <span className="text-xs font-semibold text-slate-800 truncate">
                   {pin.label}
                 </span>
                 <div className="flex items-center gap-1.5 shrink-0">
-                  <span className="text-[11px] font-mono text-amber-300 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/30">
+                  <span className="text-[11px] font-mono font-semibold text-amber-800 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-300">
                     {pin.multiplier.toFixed(2)}× ({formatCurrentPinValue(pin)})
                   </span>
                   <button
                     type="button"
                     onClick={() => onUnpinParam(pin.id)}
                     title="Unpin parameter"
-                    className="text-slate-500 hover:text-rose-400 cursor-pointer"
+                    className="text-slate-400 hover:text-red-600 cursor-pointer"
                   >
                     <X size={13} />
                   </button>
@@ -262,7 +270,7 @@ export function SensitivityPanel({
                 onChange={(e: any) =>
                   onSlidePinnedParam(pin.id, parseFloat(e.target.value))
                 }
-                className="w-full accent-amber-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+                className="w-full accent-amber-600 cursor-pointer h-1.5 bg-slate-200 rounded-lg"
               />
 
               <div className="flex justify-between text-[10px] font-mono text-slate-500">
@@ -281,9 +289,9 @@ export function SensitivityPanel({
             id="quick-pin-parameter-select"
             value={quickPinSelect}
             onChange={(e: any) => handleQuickPinAdd(e.target.value)}
-            className="w-full bg-slate-800/90 hover:bg-slate-800 text-xs text-slate-300 rounded-md px-2.5 py-1.5 border border-slate-700 cursor-pointer"
+            className="w-full bg-slate-50 hover:bg-slate-100 text-xs text-slate-700 rounded-md px-2.5 py-1.5 border border-slate-300 cursor-pointer"
           >
-            <option value="">+ Pin another member / spring / load parameter...</option>
+            <option value="">+ Pin another modulus E / spring / load parameter...</option>
             {quickPinOptions.map((opt) => (
               <option key={opt.value} value={opt.value}>
                 {opt.label}
@@ -294,31 +302,31 @@ export function SensitivityPanel({
       </div>
 
       {/* Section 3: Live Peak Structural Response Telemetry */}
-      <div className="p-3.5 border-b border-slate-800 space-y-2.5">
+      <div className="p-3.5 border-b border-slate-200 space-y-2.5">
         <div className="flex items-center gap-1.5">
-          <Gauge size={14} className="text-emerald-400" />
-          <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+          <Gauge size={14} className="text-emerald-600" />
+          <span className="text-xs font-bold uppercase tracking-wider text-slate-800">
             Peak Envelope Telemetry
           </span>
         </div>
 
         {/* Utilization Progress Bar + Governing Member Location */}
-        <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-2.5 space-y-1">
+        <div className="bg-slate-50 border border-slate-200 rounded-lg p-2.5 space-y-1">
           <div className="flex items-center justify-between text-xs">
-            <span className="text-slate-400">Governing Utilization (σ_max / fy)</span>
+            <span className="text-slate-600 font-medium">Governing Utilization (σ_max / fy)</span>
             <span
               className={`font-mono font-bold ${
                 solverOutput.globalMaxUtilization > 1.0
-                  ? 'text-rose-400'
+                  ? 'text-red-600'
                   : solverOutput.globalMaxUtilization > 0.75
-                    ? 'text-amber-300'
-                    : 'text-emerald-300'
+                    ? 'text-amber-700'
+                    : 'text-emerald-700'
               }`}
             >
               {maxEtaPct.toFixed(1)}%
             </span>
           </div>
-          <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+          <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
             <div
               style={{
                 width: `${Math.min(100, Math.max(2, maxEtaPct))}%`,
@@ -327,9 +335,9 @@ export function SensitivityPanel({
             />
           </div>
           {solverOutput.governingMember.elementId ? (
-            <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-0.5">
+            <div className="flex items-center justify-between text-[10px] font-mono text-slate-600 pt-0.5">
               <span>
-                Critical: <strong className="text-slate-200">{solverOutput.governingMember.elementId}</strong> @ x/L ={' '}
+                Critical: <strong className="text-slate-900">{solverOutput.governingMember.elementId}</strong> @ x/L ={' '}
                 {solverOutput.governingMember.xOverL.toFixed(2)}
               </span>
               <span>
@@ -340,35 +348,35 @@ export function SensitivityPanel({
         </div>
 
         <div className="grid grid-cols-2 gap-2 font-mono text-xs">
-          <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2">
-            <span className="text-[10px] font-sans text-slate-400 block">
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-2">
+            <span className="text-[10px] font-sans text-slate-500 block">
               Max Deflection |δ|
             </span>
-            <span className="text-sky-300 font-bold">
+            <span className="text-blue-700 font-bold">
               {solverOutput.globalMaxDeflectionMm.toFixed(2)} mm
             </span>
           </div>
-          <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2">
-            <span className="text-[10px] font-sans text-slate-400 block">
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-2">
+            <span className="text-[10px] font-sans text-slate-500 block">
               Max Stress σ_max
             </span>
-            <span className="text-amber-300 font-bold">
+            <span className="text-amber-700 font-bold">
               {solverOutput.globalMaxSigmaMpa.toFixed(1)} MPa
             </span>
           </div>
-          <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2">
-            <span className="text-[10px] font-sans text-slate-400 block">
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-2">
+            <span className="text-[10px] font-sans text-slate-500 block">
               Max Moment |M|
             </span>
-            <span className="text-rose-300 font-bold">
+            <span className="text-red-600 font-bold">
               {solverOutput.globalMaxM.toFixed(2)} kNm
             </span>
           </div>
-          <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2">
-            <span className="text-[10px] font-sans text-slate-400 block">
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-2">
+            <span className="text-[10px] font-sans text-slate-500 block">
               Max Shear |V| / Axial |N|
             </span>
-            <span className="text-emerald-300 font-bold">
+            <span className="text-emerald-700 font-bold">
               {solverOutput.globalMaxV.toFixed(1)} / {solverOutput.globalMaxN.toFixed(1)} kN
             </span>
           </div>
@@ -379,15 +387,15 @@ export function SensitivityPanel({
       <div className="p-3.5 space-y-3 flex-1">
         <div className="space-y-1.5">
           <div className="flex items-center gap-1.5">
-            <Activity size={14} className="text-sky-400" />
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+            <Activity size={14} className="text-blue-600" />
+            <span className="text-xs font-bold uppercase tracking-wider text-slate-800">
               Member Envelope Extrema (x/L)
             </span>
           </div>
 
-          <div className="bg-slate-950/70 border border-slate-800 rounded-lg overflow-hidden">
+          <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
             <table className="w-full text-[10.5px] font-mono text-left">
-              <thead className="bg-slate-900 text-slate-400 border-b border-slate-800">
+              <thead className="bg-slate-100 text-slate-600 border-b border-slate-200">
                 <tr>
                   <th className="py-1.5 px-2">ID</th>
                   <th className="py-1.5 px-1.5 text-right">M_ext (x/L)</th>
@@ -395,7 +403,7 @@ export function SensitivityPanel({
                   <th className="py-1.5 px-2 text-right">σ/fy</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-800/60">
+              <tbody className="divide-y divide-slate-200">
                 {model.elements
                   .filter((e): e is Frame2DElement => e.kind === 'frame2d')
                   .map((el) => {
@@ -414,17 +422,17 @@ export function SensitivityPanel({
                       <tr
                         key={el.id}
                         onClick={() => onSelectEntity('member', el.id)}
-                        className="hover:bg-slate-800/60 cursor-pointer transition-colors"
+                        className="hover:bg-blue-50/70 cursor-pointer transition-colors"
                       >
-                        <td className="py-1.5 px-2 font-bold text-sky-300">{el.id}</td>
-                        <td className="py-1.5 px-1.5 text-right text-rose-300">
+                        <td className="py-1.5 px-2 font-bold text-blue-700">{el.id}</td>
+                        <td className="py-1.5 px-1.5 text-right text-red-600 font-medium">
                           {govM.value.toFixed(1)}{' '}
-                          <span className="text-slate-500">({govM.xOverL.toFixed(2)})</span>
+                          <span className="text-slate-400">({govM.xOverL.toFixed(2)})</span>
                         </td>
-                        <td className="py-1.5 px-1.5 text-right text-emerald-300">
+                        <td className="py-1.5 px-1.5 text-right text-emerald-700 font-medium">
                           {govV.value.toFixed(1)}
                         </td>
-                        <td className="py-1.5 px-2 text-right text-amber-300">
+                        <td className="py-1.5 px-2 text-right text-amber-700 font-semibold">
                           {(extrema.governingUtilization.value * 100).toFixed(0)}%
                         </td>
                       </tr>
@@ -437,15 +445,15 @@ export function SensitivityPanel({
 
         <div className="space-y-1.5">
           <div className="flex items-center gap-1.5">
-            <Activity size={14} className="text-teal-400" />
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+            <Activity size={14} className="text-teal-600" />
+            <span className="text-xs font-bold uppercase tracking-wider text-slate-800">
               Support & Spring Reactions
             </span>
           </div>
 
-          <div className="bg-slate-950/70 border border-slate-800 rounded-lg overflow-hidden">
+          <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
             <table className="w-full text-[11px] font-mono text-left">
-              <thead className="bg-slate-900 text-slate-400 border-b border-slate-800">
+              <thead className="bg-slate-100 text-slate-600 border-b border-slate-200">
                 <tr>
                   <th className="py-1.5 px-2">Node</th>
                   <th className="py-1.5 px-2 text-right">Rx (kN)</th>
@@ -453,7 +461,7 @@ export function SensitivityPanel({
                   <th className="py-1.5 px-2 text-right">Mz (kNm)</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-800/60">
+              <tbody className="divide-y divide-slate-200">
                 {model.nodes
                   .filter((n) => solverOutput.nodeResults[n.id]?.hasReaction)
                   .map((n) => {
@@ -462,12 +470,12 @@ export function SensitivityPanel({
                       <tr
                         key={n.id}
                         onClick={() => onSelectEntity('node', n.id)}
-                        className="hover:bg-slate-800/60 cursor-pointer transition-colors"
+                        className="hover:bg-teal-50/70 cursor-pointer transition-colors"
                       >
-                        <td className="py-1.5 px-2 font-bold text-teal-300">{n.id}</td>
-                        <td className="py-1.5 px-2 text-right">{nr.reactionFx.toFixed(1)}</td>
-                        <td className="py-1.5 px-2 text-right">{nr.reactionFy.toFixed(1)}</td>
-                        <td className="py-1.5 px-2 text-right">{nr.reactionMz.toFixed(1)}</td>
+                        <td className="py-1.5 px-2 font-bold text-teal-700">{n.id}</td>
+                        <td className="py-1.5 px-2 text-right text-slate-800">{nr.reactionFx.toFixed(1)}</td>
+                        <td className="py-1.5 px-2 text-right text-slate-800">{nr.reactionFy.toFixed(1)}</td>
+                        <td className="py-1.5 px-2 text-right text-slate-800">{nr.reactionMz.toFixed(1)}</td>
                       </tr>
                     );
                   })}
@@ -479,3 +487,4 @@ export function SensitivityPanel({
     </aside>
   );
 }
+

@@ -76,31 +76,32 @@ export interface LoadScreenHandle {
 }
 
 /**
- * Interpolate green -> yellow -> amber -> crimson utilization color for eta = sigma_max / fy
+ * Interpolate emerald (#059669) -> amber (#d97706) -> crimson (#dc2626) utilization color
+ * tuned for high contrast on a pure white (#ffffff) background.
  */
 export function utilizationToColor(eta: number, alpha = 1): string {
   const t = Math.max(0, Math.min(1.25, eta));
-  let r = 16;
-  let g = 185;
-  let b = 129;
+  let r = 5;
+  let g = 150;
+  let b = 105;
 
   if (t <= 0.5) {
-    // Emerald (#10b981) -> Amber/Yellow (#eab308)
+    // Emerald (#059669) -> Amber (#d97706)
     const u = t / 0.5;
-    r = Math.round(16 + u * (234 - 16));
-    g = Math.round(185 + u * (179 - 185));
-    b = Math.round(129 + u * (8 - 129));
+    r = Math.round(5 + u * (217 - 5));
+    g = Math.round(150 + u * (119 - 150));
+    b = Math.round(105 + u * (6 - 105));
   } else if (t <= 1.0) {
-    // Yellow (#eab308) -> Orange-Red (#f97316 -> #ef4444)
+    // Amber (#d97706) -> Crimson (#dc2626)
     const u = (t - 0.5) / 0.5;
-    r = Math.round(234 + u * (239 - 234));
-    g = Math.round(179 + u * (68 - 179));
-    b = Math.round(8 + u * (68 - 8));
+    r = Math.round(217 + u * (220 - 217));
+    g = Math.round(119 + u * (38 - 119));
+    b = Math.round(6 + u * (38 - 6));
   } else {
-    // Overstressed (> 1.0): bright crimson (#dc2626)
-    r = 220;
-    g = 38;
-    b = 38;
+    // Overstressed (> 1.0): deep crimson (#b91c1c)
+    r = 185;
+    g = 28;
+    b = 28;
   }
 
   return alpha < 1 ? `rgba(${r}, ${g}, ${b}, ${alpha})` : `rgb(${r}, ${g}, ${b})`;
@@ -134,9 +135,9 @@ function drawRoundedBadge(
   text: string,
   cx: number,
   cy: number,
-  bgColor: string,
-  borderColor: string,
-  textColor: string,
+  bgColor: string = 'rgba(255, 255, 255, 0.92)',
+  borderColor: string = '#cbd5e1',
+  textColor: string = '#0f172a',
   font = '600 11px "JetBrains Mono", ui-monospace, monospace'
 ): void {
   ctx.save();
@@ -151,7 +152,7 @@ function drawRoundedBadge(
 
   ctx.fillStyle = bgColor;
   ctx.strokeStyle = borderColor;
-  ctx.lineWidth = 1;
+  ctx.lineWidth = 1.2;
 
   ctx.beginPath();
   ctx.roundRect(x, y, w, h, r);
@@ -280,7 +281,7 @@ export class CanvasRenderer {
     ctx.scale(dpr, dpr);
     this.render(ctx, vp, model, solverResults, snapshotLayers, neutralInteraction);
 
-    // Draw clean report caption stamp in top-left corner
+    // Draw clean report caption stamp in top-left corner on white pill background
     const modeLabelMap: Record<SnapshotOverlayMode, string> = {
       geometry: 'Structural Geometry & Applied Loading',
       deformed: `Deformed Shape (${snapshotLayers.deflectionScale}× Exaggeration) · Max |δ| = ${solverResults.globalMaxDeflectionMm.toFixed(2)} mm`,
@@ -297,9 +298,9 @@ export class CanvasRenderer {
       `${model.name} · ${modeLabelMap[overlayMode]}`,
       Math.min(cssWidth * 0.5, 290),
       24,
-      'rgba(15, 23, 42, 0.92)',
-      '#38bdf8',
-      '#f8fafc',
+      'rgba(255, 255, 255, 0.94)',
+      '#2563eb',
+      '#0f172a',
       '600 11px "JetBrains Mono", ui-monospace, monospace'
     );
     ctx.restore();
@@ -325,8 +326,8 @@ export class CanvasRenderer {
     const loadHandles: LoadScreenHandle[] = [];
 
     ctx.save();
-    // Clear canvas with deep engineering slate background
-    ctx.fillStyle = '#0b101b';
+    // Clear canvas with pure white (#ffffff) engineering drafting background
+    ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, width, height);
 
     const nodeMap = new Map<string, StructuralNode>();
@@ -392,9 +393,9 @@ export class CanvasRenderer {
     const minY = Math.floor(Math.min(topLeft.y, botRight.y) - 1);
     const maxY = Math.ceil(Math.max(topLeft.y, botRight.y) + 1);
 
-    // Minor 0.1 m grid lines (visible when zoom >= 42 px/m so spacing >= 4.2px)
-    if (vp.zoom >= 42) {
-      ctx.strokeStyle = vp.zoom >= 80 ? 'rgba(148, 163, 184, 0.08)' : 'rgba(148, 163, 184, 0.045)';
+    // Minor 0.1 m grid lines in crisp light-drafting gray (#f1f5f9)
+    if (vp.zoom >= 36) {
+      ctx.strokeStyle = '#f1f5f9';
       ctx.lineWidth = 1;
       ctx.beginPath();
 
@@ -420,8 +421,8 @@ export class CanvasRenderer {
       ctx.stroke();
     }
 
-    // Major 1.0 m grid lines
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.14)';
+    // Major 1.0 m grid lines in #cbd5e1
+    ctx.strokeStyle = '#cbd5e1';
     ctx.lineWidth = 1;
     ctx.beginPath();
 
@@ -445,7 +446,7 @@ export class CanvasRenderer {
     if (vp.coordSystem === 'polar') {
       const origScreen = worldToScreen(vp.polarOrigin, vp);
       ctx.save();
-      ctx.strokeStyle = 'rgba(56, 189, 248, 0.18)';
+      ctx.strokeStyle = 'rgba(37, 99, 235, 0.22)';
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
       const maxR = Math.ceil(Math.hypot(maxX - minX, maxY - minY));
@@ -467,9 +468,9 @@ export class CanvasRenderer {
       ctx.restore();
     }
 
-    // World Coordinate Axes X = 0 and Y = 0
+    // World Coordinate Axes X = 0 and Y = 0 in #64748b
     const origin = worldToScreen({ x: 0, y: 0 }, vp);
-    ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
+    ctx.strokeStyle = '#64748b';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     if (origin.sx >= 0 && origin.sx <= vp.width) {
@@ -482,18 +483,22 @@ export class CanvasRenderer {
     }
     ctx.stroke();
 
-    // Meter coordinate tick labels along major grid lines
-    ctx.fillStyle = 'rgba(148, 163, 184, 0.48)';
+    // Meter coordinate tick labels along major grid lines in dark #334155 with subtle white halo
     ctx.font = '500 10px "JetBrains Mono", ui-monospace, monospace';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.fillStyle = '#334155';
     const labelStep = vp.zoom < 38 ? 2 : 1;
 
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
-    const axisY = Math.min(vp.height - 18, Math.max(8, origin.sy + 5));
+    const axisY = Math.min(vp.height - 20, Math.max(8, origin.sy + 5));
     for (let x = minX; x <= maxX; x += labelStep) {
       const sx = vp.panX + x * vp.zoom;
       if (sx > 30 && sx < vp.width - 30) {
-        ctx.fillText(`${x}m`, sx, axisY);
+        const txt = `${x}m`;
+        ctx.strokeText(txt, sx, axisY);
+        ctx.fillText(txt, sx, axisY);
       }
     }
 
@@ -504,7 +509,9 @@ export class CanvasRenderer {
       if (y === 0) continue;
       const sy = vp.panY - y * vp.zoom;
       if (sy > 24 && sy < vp.height - 24) {
-        ctx.fillText(`${y}m`, axisX, sy);
+        const txt = `${y}m`;
+        ctx.strokeText(txt, axisX, sy);
+        ctx.fillText(txt, axisX, sy);
       }
     }
   }
@@ -528,18 +535,17 @@ export class CanvasRenderer {
       const sj = worldToScreen(nj, vp);
 
       // Proportional stroke width based on cross-section depth (depthMm in mm)
-      // e.g. 120mm -> ~3.5px, 350mm -> ~6.5px, 500mm -> ~8.5px
       const depthMm = el.section.depthMm ?? 300;
-      const baseThickness = Math.min(12, Math.max(3, 2.2 + (depthMm / 1000) * 12));
+      const baseThickness = Math.min(12, Math.max(3.2, 2.4 + (depthMm / 1000) * 12));
 
       const isSelected = interaction.selectedElementId === el.id;
       const isHovered = interaction.hoveredElementId === el.id;
 
-      // Selection / hover outer glow
+      // Selection / hover outer halo
       if (isSelected || isHovered) {
         ctx.save();
-        ctx.strokeStyle = isSelected ? 'rgba(56, 189, 248, 0.45)' : 'rgba(148, 163, 184, 0.28)';
-        ctx.lineWidth = baseThickness + 7;
+        ctx.strokeStyle = isSelected ? 'rgba(37, 99, 235, 0.25)' : 'rgba(100, 116, 139, 0.22)';
+        ctx.lineWidth = baseThickness + 8;
         ctx.lineCap = 'round';
         ctx.beginPath();
         ctx.moveTo(si.sx, si.sy);
@@ -571,14 +577,12 @@ export class CanvasRenderer {
         }
         ctx.restore();
       } else {
-        // Render material-tinted structural member with architectural depth
-        let strokeColor = '#60a5fa'; // Steel blue
-        if (el.material.preset === 'concrete') strokeColor = '#94a3b8'; // Concrete slate
-        if (el.material.preset === 'timber') strokeColor = '#f59e0b'; // Timber amber
-        if (el.material.preset === 'custom') strokeColor = '#38bdf8';
-        if (isSelected) strokeColor = '#38bdf8';
+        // Undeformed members in dark slate (#1e293b); selected members in vivid royal blue (#2563eb)
+        let strokeColor = '#1e293b';
+        if (el.material.preset === 'concrete') strokeColor = '#475569';
+        if (el.material.preset === 'timber') strokeColor = '#b45309';
+        if (isSelected) strokeColor = '#2563eb';
 
-        // Outer flange edge
         ctx.save();
         ctx.strokeStyle = strokeColor;
         ctx.lineWidth = baseThickness;
@@ -589,9 +593,9 @@ export class CanvasRenderer {
         ctx.stroke();
 
         // Subtle inner web highlight for depth
-        if (baseThickness >= 5) {
-          ctx.strokeStyle = 'rgba(15, 23, 42, 0.5)';
-          ctx.lineWidth = Math.max(1.5, baseThickness - 3.2);
+        if (baseThickness >= 5.5) {
+          ctx.strokeStyle = isSelected ? 'rgba(219, 234, 254, 0.45)' : 'rgba(241, 245, 249, 0.35)';
+          ctx.lineWidth = Math.max(1.2, baseThickness - 3.6);
           ctx.beginPath();
           ctx.moveTo(si.sx, si.sy);
           ctx.lineTo(sj.sx, sj.sy);
@@ -600,7 +604,7 @@ export class CanvasRenderer {
         ctx.restore();
       }
 
-      // Render member end hinges (open circles offset 12px inward from member start/end)
+      // Render member end hinges (open circles with white fill offset 12px inward from member start/end)
       const dx = sj.sx - si.sx;
       const dy = sj.sy - si.sy;
       const screenLen = Math.hypot(dx, dy);
@@ -608,15 +612,15 @@ export class CanvasRenderer {
         const ux = dx / screenLen;
         const uy = dy / screenLen;
         const hingeOffset = 12;
-        const hingeRadius = 4.6;
+        const hingeRadius = 4.8;
 
         if (el.releaseStart) {
           const hx = si.sx + ux * hingeOffset;
           const hy = si.sy + uy * hingeOffset;
           ctx.save();
-          ctx.fillStyle = '#0b101b';
-          ctx.strokeStyle = '#fbbf24';
-          ctx.lineWidth = 2;
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = '#d97706';
+          ctx.lineWidth = 2.2;
           ctx.beginPath();
           ctx.arc(hx, hy, hingeRadius, 0, Math.PI * 2);
           ctx.fill();
@@ -628,9 +632,9 @@ export class CanvasRenderer {
           const hx = sj.sx - ux * hingeOffset;
           const hy = sj.sy - uy * hingeOffset;
           ctx.save();
-          ctx.fillStyle = '#0b101b';
-          ctx.strokeStyle = '#fbbf24';
-          ctx.lineWidth = 2;
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = '#d97706';
+          ctx.lineWidth = 2.2;
           ctx.beginPath();
           ctx.arc(hx, hy, hingeRadius, 0, Math.PI * 2);
           ctx.fill();
@@ -648,14 +652,15 @@ export class CanvasRenderer {
 
         if (layers.showHeatmap && solverOutput.stable && elRes) {
           const pct = (elRes.maxUtilization * 100).toFixed(0);
+          const uCol = utilizationToColor(elRes.maxUtilization);
           drawRoundedBadge(
             ctx,
             `${el.id}: ${pct}% (${elRes.maxSigmaMpa.toFixed(1)} MPa)`,
             midX + nx * 16,
             midY + ny * 16,
-            'rgba(15, 23, 42, 0.88)',
-            utilizationToColor(elRes.maxUtilization),
-            '#f8fafc',
+            'rgba(255, 255, 255, 0.92)',
+            uCol,
+            uCol,
             '600 10px "JetBrains Mono", ui-monospace, monospace'
           );
         } else if (isSelected) {
@@ -664,9 +669,9 @@ export class CanvasRenderer {
             `${el.id} · ${el.section.name}`,
             midX + nx * 16,
             midY + ny * 16,
-            'rgba(15, 23, 42, 0.9)',
-            '#38bdf8',
-            '#e0f2fe',
+            'rgba(255, 255, 255, 0.94)',
+            '#2563eb',
+            '#1d4ed8',
             '600 10px "JetBrains Mono", ui-monospace, monospace'
           );
         }
@@ -682,15 +687,11 @@ export class CanvasRenderer {
     for (const node of model.nodes) {
       const sc = worldToScreen(node, vp);
 
-      // 1. Render Nodal Restraint Support Symbols
+      // 1. Render Nodal Restraint Support Symbols in deep teal/slate (#0f766e / #334155)
       if (node.support !== 'none') {
         ctx.save();
         ctx.translate(sc.sx, sc.sy);
 
-        // Determine rotation angle of support base:
-        // rollerX / pinned / fixed: horizontal ground below node (0 rad)
-        // rollerY: vertical wall to the left of node (-90 deg in screen)
-        // inclinedRoller: rotated by -inclinedAngleDeg (since screen +Y is down and world +Y is up)
         let rotRad = 0;
         if (node.support === 'rollerY') {
           rotRad = -Math.PI / 2;
@@ -699,9 +700,9 @@ export class CanvasRenderer {
         }
         ctx.rotate(rotRad);
 
-        ctx.strokeStyle = '#2dd4bf'; // Teal engineering support symbol
-        ctx.fillStyle = 'rgba(45, 212, 191, 0.16)';
-        ctx.lineWidth = 1.8;
+        ctx.strokeStyle = '#0f766e'; // Deep teal support symbol
+        ctx.fillStyle = 'rgba(15, 118, 110, 0.14)';
+        ctx.lineWidth = 1.9;
 
         if (node.support === 'fixed') {
           // Fixed support block & hatches
@@ -710,12 +711,13 @@ export class CanvasRenderer {
           ctx.lineTo(14, 4);
           ctx.stroke();
 
-          ctx.fillStyle = 'rgba(45, 212, 191, 0.22)';
+          ctx.fillStyle = 'rgba(15, 118, 110, 0.18)';
           ctx.fillRect(-10, -4, 20, 8);
           ctx.strokeRect(-10, -4, 20, 8);
 
-          // Ground hatches
-          ctx.lineWidth = 1.3;
+          // Ground hatches in slate #334155
+          ctx.strokeStyle = '#334155';
+          ctx.lineWidth = 1.4;
           for (let hx = -12; hx <= 12; hx += 6) {
             ctx.beginPath();
             ctx.moveTo(hx, 4);
@@ -733,11 +735,12 @@ export class CanvasRenderer {
           ctx.stroke();
 
           // Ground line & hatches
+          ctx.strokeStyle = '#334155';
           ctx.beginPath();
           ctx.moveTo(-15, 17);
           ctx.lineTo(15, 17);
           ctx.stroke();
-          ctx.lineWidth = 1.2;
+          ctx.lineWidth = 1.3;
           for (let hx = -12; hx <= 12; hx += 6) {
             ctx.beginPath();
             ctx.moveTo(hx, 17);
@@ -764,15 +767,16 @@ export class CanvasRenderer {
           ctx.arc(5, 17.5, 2.8, 0, Math.PI * 2);
           ctx.stroke();
 
-          // Ground line
+          // Ground line in #334155
+          ctx.strokeStyle = '#334155';
           ctx.beginPath();
           ctx.moveTo(-14, 21);
           ctx.lineTo(14, 21);
           ctx.stroke();
 
           if (node.support === 'inclinedRoller') {
-            ctx.fillStyle = '#5eead4';
-            ctx.font = '600 9px "JetBrains Mono", ui-monospace, monospace';
+            ctx.fillStyle = '#0f766e';
+            ctx.font = '600 9.5px "JetBrains Mono", ui-monospace, monospace';
             ctx.textAlign = 'center';
             ctx.fillText(`α=${node.inclinedAngleDeg ?? 0}°`, 0, 31);
           }
@@ -781,14 +785,13 @@ export class CanvasRenderer {
         ctx.restore();
       }
 
-      // 2. Render Elastic Springs (kx, ky, krz)
+      // 2. Render Elastic Springs (kx, ky, krz) in rich purple (#7c3aed)
       const { kx, ky, krz } = node.springs;
 
       if (ky > 0) {
-        // Vertical spring coil below node
         ctx.save();
-        ctx.strokeStyle = '#a78bfa';
-        ctx.lineWidth = 1.7;
+        ctx.strokeStyle = '#7c3aed';
+        ctx.lineWidth = 1.8;
         const startY = sc.sy + (node.support !== 'none' ? 22 : 4);
         ctx.beginPath();
         ctx.moveTo(sc.sx, startY);
@@ -810,10 +813,9 @@ export class CanvasRenderer {
       }
 
       if (kx > 0) {
-        // Horizontal spring coil to the left of node
         ctx.save();
-        ctx.strokeStyle = '#a78bfa';
-        ctx.lineWidth = 1.7;
+        ctx.strokeStyle = '#7c3aed';
+        ctx.lineWidth = 1.8;
         const startX = sc.sx - 4;
         ctx.beginPath();
         ctx.moveTo(startX, sc.sy);
@@ -835,10 +837,9 @@ export class CanvasRenderer {
       }
 
       if (krz > 0) {
-        // Rotational spiral spring symbol around node
         ctx.save();
-        ctx.strokeStyle = '#c084fc';
-        ctx.lineWidth = 1.8;
+        ctx.strokeStyle = '#7c3aed';
+        ctx.lineWidth = 1.9;
         ctx.beginPath();
         const turns = 1.65;
         const steps = 28;
@@ -852,10 +853,16 @@ export class CanvasRenderer {
           else ctx.lineTo(px, py);
         }
         ctx.stroke();
-        ctx.fillStyle = '#d8b4fe';
-        ctx.font = '600 9.5px "JetBrains Mono", ui-monospace, monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText(`kθ=${(krz / 1000).toFixed(1)}k`, sc.sx, sc.sy - 17);
+        drawRoundedBadge(
+          ctx,
+          `kθ=${(krz / 1000).toFixed(1)}k`,
+          sc.sx,
+          sc.sy - 20,
+          'rgba(255, 255, 255, 0.92)',
+          '#7c3aed',
+          '#6d28d9',
+          '600 9.5px "JetBrains Mono", ui-monospace, monospace'
+        );
         ctx.restore();
       }
     }
@@ -869,7 +876,6 @@ export class CanvasRenderer {
     nodeMap: Map<string, StructuralNode>,
     loadHandles: LoadScreenHandle[]
   ): void {
-    // Compute max distributed load and max point load for visual scaling
     let maxDist = 10;
     let maxPoint = 10;
 
@@ -885,8 +891,9 @@ export class CanvasRenderer {
 
     for (const ld of model.loads) {
       const isSelected = interaction.selectedLoadId === ld.id;
-      const strokeCol = isSelected ? '#fde047' : '#fb923c';
-      const fillCol = isSelected ? 'rgba(253, 224, 71, 0.22)' : 'rgba(251, 146, 60, 0.16)';
+      const strokeCol = isSelected ? '#2563eb' : '#d97706';
+      const fillCol = isSelected ? 'rgba(37, 99, 235, 0.14)' : 'rgba(217, 119, 6, 0.14)';
+      const textCol = isSelected ? '#1d4ed8' : '#b45309';
 
       if (ld.kind === 'member_distributed') {
         const el = model.elements.find(
@@ -900,13 +907,11 @@ export class CanvasRenderer {
         const si = worldToScreen(ni, vp);
         const sj = worldToScreen(nj, vp);
 
-        // Determine unit screen vector in the direction the load pushes
         const L = Math.hypot(nj.x - ni.x, nj.y - ni.y);
         if (L < 1e-6) continue;
         const cos = (nj.x - ni.x) / L;
         const sin = (nj.y - ni.y) / L;
 
-        // World force unit direction for a +1 load value:
         let fDirWorldX = 0;
         let fDirWorldY = 0;
         if (ld.direction === 'global_x') {
@@ -916,17 +921,14 @@ export class CanvasRenderer {
           fDirWorldX = 0;
           fDirWorldY = 1;
         } else {
-          // local_perp (+y local = (-sin, cos))
           fDirWorldX = -sin;
           fDirWorldY = cos;
         }
 
-        // Screen force direction (note screen Y is inverted from world Y)
         const fDirScreenX = fDirWorldX;
         const fDirScreenY = -fDirWorldY;
 
         const maxEnvPx = 46;
-        // Offset tail away from member in opposite direction of force so arrows point ONTO the member
         const h1 = (ld.w1 / maxDist) * maxEnvPx;
         const h2 = (ld.w2 / maxDist) * maxEnvPx;
 
@@ -938,9 +940,8 @@ export class CanvasRenderer {
         ctx.save();
         ctx.fillStyle = fillCol;
         ctx.strokeStyle = strokeCol;
-        ctx.lineWidth = isSelected ? 2.2 : 1.5;
+        ctx.lineWidth = isSelected ? 2.2 : 1.6;
 
-        // Shaded trapezoidal load envelope polygon
         ctx.beginPath();
         ctx.moveTo(si.sx, si.sy);
         ctx.lineTo(tail1X, tail1Y);
@@ -950,7 +951,6 @@ export class CanvasRenderer {
         ctx.fill();
         ctx.stroke();
 
-        // Draw comb arrows along the member
         const screenSpan = Math.hypot(sj.sx - si.sx, sj.sy - si.sy);
         const numArrows = Math.max(3, Math.min(12, Math.floor(screenSpan / 28)));
         ctx.fillStyle = strokeCol;
@@ -972,7 +972,6 @@ export class CanvasRenderer {
           drawArrowhead(ctx, bx, by, bx - tx, by - ty, Math.min(7, arrowLen * 0.6));
         }
 
-        // Interactive click handle & label at midpoint of envelope top edge
         const handleX = 0.5 * (tail1X + tail2X);
         const handleY = 0.5 * (tail1Y + tail2Y);
         loadHandles.push({ loadId: ld.id, sx: handleX, sy: handleY });
@@ -987,9 +986,9 @@ export class CanvasRenderer {
           labelText,
           handleX,
           handleY,
-          isSelected ? 'rgba(15, 23, 42, 0.96)' : 'rgba(15, 23, 42, 0.85)',
+          'rgba(255, 255, 255, 0.92)',
           strokeCol,
-          isSelected ? '#fde047' : '#fdba74',
+          textCol,
           '600 10px "JetBrains Mono", ui-monospace, monospace'
         );
 
@@ -1048,9 +1047,9 @@ export class CanvasRenderer {
           `${Math.abs(ld.p).toFixed(1)} kN`,
           tailX - dirSx * 10,
           tailY - dirSy * 10,
-          'rgba(15, 23, 42, 0.9)',
+          'rgba(255, 255, 255, 0.92)',
           strokeCol,
-          isSelected ? '#fde047' : '#fdba74',
+          textCol,
           '600 10.5px "JetBrains Mono", ui-monospace, monospace'
         );
         ctx.restore();
@@ -1083,9 +1082,9 @@ export class CanvasRenderer {
             `${fMag.toFixed(1)} kN`,
             tailX - dirSx * 11,
             tailY - dirSy * 11,
-            'rgba(15, 23, 42, 0.9)',
+            'rgba(255, 255, 255, 0.92)',
             strokeCol,
-            isSelected ? '#fde047' : '#fdba74',
+            textCol,
             '600 10.5px "JetBrains Mono", ui-monospace, monospace'
           );
           ctx.restore();
@@ -1106,9 +1105,9 @@ export class CanvasRenderer {
             `${ld.mz.toFixed(1)} kNm`,
             tip.sx,
             tip.sy - r - 10,
-            'rgba(15, 23, 42, 0.9)',
+            'rgba(255, 255, 255, 0.92)',
             strokeCol,
-            isSelected ? '#fde047' : '#fdba74'
+            textCol
           );
           ctx.restore();
         }
@@ -1124,8 +1123,8 @@ export class CanvasRenderer {
     layers: RenderLayerOptions
   ): void {
     ctx.save();
-    ctx.strokeStyle = '#38bdf8';
-    ctx.lineWidth = 2.4;
+    ctx.strokeStyle = '#2563eb';
+    ctx.lineWidth = 2.5;
 
     // Convert mm deflection * exaggeration scale to world meters (* 1e-3)
     const scaleMPerMm = layers.deflectionScale * 1e-3;
@@ -1156,9 +1155,9 @@ export class CanvasRenderer {
           },
           vp
         );
-        ctx.fillStyle = '#0284c7';
+        ctx.fillStyle = '#1d4ed8';
         ctx.beginPath();
-        ctx.arc(sc.sx, sc.sy, 3.2, 0, Math.PI * 2);
+        ctx.arc(sc.sx, sc.sy, 3.3, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -1188,28 +1187,27 @@ export class CanvasRenderer {
       const elRes = solverOutput.elementResults[el.id];
       if (!elRes || elRes.stations.length < 2) continue;
 
-      // Local +y normal in world is (-sin, cos), so in screen pixels:
-      // screenNormalX = -sin, screenNormalY = -cos
       const nSx = -elRes.sin;
       const nSy = -elRes.cos;
 
       const getVal = (st: (typeof elRes.stations)[number]): number => {
         if (diagramType === 'N') return st.N;
         if (diagramType === 'V') return st.V;
-        // For Moment M:
-        // Positive M is sagging (bottom fiber -y in tension, top fiber +y in compression).
-        // When momentSide === 'tension', plot positive M toward bottom fiber (-y local => -nSx, -nSy).
         return layers.momentSide === 'tension' ? -st.M : st.M;
       };
 
+      // High-contrast colors tuned for white background:
+      // N: #7c3aed (purple), V: #059669 (emerald), M: #dc2626 (red)
       const strokeCol =
-        diagramType === 'N' ? '#a855f7' : diagramType === 'V' ? '#10b981' : '#f43f5e';
+        diagramType === 'N' ? '#7c3aed' : diagramType === 'V' ? '#059669' : '#dc2626';
       const fillCol =
         diagramType === 'N'
-          ? 'rgba(168, 85, 247, 0.18)'
+          ? 'rgba(124, 58, 237, 0.14)'
           : diagramType === 'V'
-            ? 'rgba(16, 185, 129, 0.18)'
-            : 'rgba(244, 63, 94, 0.20)';
+            ? 'rgba(5, 150, 105, 0.14)'
+            : 'rgba(220, 38, 38, 0.15)';
+      const textCol =
+        diagramType === 'N' ? '#6d28d9' : diagramType === 'V' ? '#047857' : '#b91c1c';
 
       ctx.save();
       ctx.fillStyle = fillCol;
@@ -1261,7 +1259,7 @@ export class CanvasRenderer {
       ctx.lineTo(endBase.sx, endBase.sy);
       ctx.stroke();
 
-      // Peak value callout on element if significant
+      // Peak value callout on white pill background so numbers never clash with grid lines
       if (Math.abs(peakVal) > 0.05) {
         const unit = diagramType === 'M' ? 'kNm' : 'kN';
         const prefix =
@@ -1271,9 +1269,9 @@ export class CanvasRenderer {
           `${prefix}${Math.abs(peakVal).toFixed(1)} ${unit}`,
           peakPos.sx,
           peakPos.sy,
-          'rgba(15, 23, 42, 0.88)',
+          'rgba(255, 255, 255, 0.92)',
           strokeCol,
-          '#f8fafc',
+          textCol,
           '600 9.5px "JetBrains Mono", ui-monospace, monospace'
         );
       }
@@ -1294,8 +1292,8 @@ export class CanvasRenderer {
       const sc = worldToScreen(node, vp);
 
       ctx.save();
-      ctx.strokeStyle = '#34d399';
-      ctx.fillStyle = '#34d399';
+      ctx.strokeStyle = '#059669';
+      ctx.fillStyle = '#059669';
       ctx.lineWidth = 2.2;
 
       if (Math.abs(nr.reactionFy) > 0.05) {
@@ -1315,9 +1313,9 @@ export class CanvasRenderer {
           `Ry=${nr.reactionFy.toFixed(1)} kN`,
           sc.sx,
           Math.max(tipY, tailY) + 12,
-          'rgba(6, 78, 59, 0.92)',
-          '#34d399',
-          '#ecfdf5',
+          'rgba(255, 255, 255, 0.92)',
+          '#059669',
+          '#047857',
           '600 9.5px "JetBrains Mono", ui-monospace, monospace'
         );
       }
@@ -1338,9 +1336,9 @@ export class CanvasRenderer {
           `Rx=${nr.reactionFx.toFixed(1)} kN`,
           tailX - dirSx * 28,
           sc.sy - 12,
-          'rgba(6, 78, 59, 0.92)',
-          '#34d399',
-          '#ecfdf5',
+          'rgba(255, 255, 255, 0.92)',
+          '#059669',
+          '#047857',
           '600 9.5px "JetBrains Mono", ui-monospace, monospace'
         );
       }
@@ -1351,9 +1349,9 @@ export class CanvasRenderer {
           `Mz=${nr.reactionMz.toFixed(1)} kNm`,
           sc.sx + 44,
           sc.sy + 20,
-          'rgba(6, 78, 59, 0.92)',
-          '#34d399',
-          '#ecfdf5',
+          'rgba(255, 255, 255, 0.92)',
+          '#059669',
+          '#047857',
           '600 9.5px "JetBrains Mono", ui-monospace, monospace'
         );
       }
@@ -1374,25 +1372,28 @@ export class CanvasRenderer {
 
       ctx.save();
       if (isSelected) {
-        ctx.fillStyle = 'rgba(56, 189, 248, 0.28)';
+        ctx.fillStyle = 'rgba(37, 99, 235, 0.22)';
         ctx.beginPath();
         ctx.arc(sc.sx, sc.sy, 11, 0, Math.PI * 2);
         ctx.fill();
       }
 
-      ctx.fillStyle = isSelected ? '#38bdf8' : '#f8fafc';
-      ctx.strokeStyle = '#0f172a';
-      ctx.lineWidth = 2;
+      ctx.fillStyle = isSelected ? '#2563eb' : '#ffffff';
+      ctx.strokeStyle = isSelected ? '#1d4ed8' : '#1e293b';
+      ctx.lineWidth = 2.2;
       ctx.beginPath();
       ctx.arc(sc.sx, sc.sy, isSelected ? 6 : 4.8, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
 
-      // Node ID tag
-      ctx.fillStyle = isSelected ? '#38bdf8' : 'rgba(226, 232, 240, 0.78)';
+      // Node ID tag with white halo so it never clashes with grid lines
       ctx.font = '600 10.5px "JetBrains Mono", ui-monospace, monospace';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'bottom';
+      ctx.lineWidth = 3.2;
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+      ctx.strokeText(node.id, sc.sx + 7, sc.sy - 5);
+      ctx.fillStyle = isSelected ? '#2563eb' : '#0f172a';
       ctx.fillText(node.id, sc.sx + 7, sc.sy - 5);
       ctx.restore();
     }
@@ -1414,7 +1415,7 @@ export class CanvasRenderer {
       const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
 
       ctx.save();
-      ctx.strokeStyle = '#38bdf8';
+      ctx.strokeStyle = '#2563eb';
       ctx.lineWidth = 2.5;
       ctx.setLineDash([6, 4]);
       ctx.beginPath();
@@ -1423,6 +1424,12 @@ export class CanvasRenderer {
       ctx.stroke();
       ctx.setLineDash([]);
 
+      // Highlight start point dot
+      ctx.fillStyle = '#2563eb';
+      ctx.beginPath();
+      ctx.arc(sStart.sx, sStart.sy, 5, 0, Math.PI * 2);
+      ctx.fill();
+
       const midX = (sStart.sx + snapTarget.sx) * 0.5;
       const midY = (sStart.sy + snapTarget.sy) * 0.5 - 18;
       drawRoundedBadge(
@@ -1430,9 +1437,9 @@ export class CanvasRenderer {
         `L = ${lenM.toFixed(2)} m · ∠ ${angleDeg.toFixed(1)}°`,
         midX,
         midY,
-        'rgba(2, 132, 199, 0.95)',
-        '#7dd3fc',
-        '#ffffff',
+        'rgba(255, 255, 255, 0.95)',
+        '#2563eb',
+        '#1d4ed8',
         '600 11px "JetBrains Mono", ui-monospace, monospace'
       );
       ctx.restore();
@@ -1442,15 +1449,17 @@ export class CanvasRenderer {
     if (snapTarget && activeTool !== 'select') {
       ctx.save();
       if (snapTarget.kind === 'node') {
-        ctx.strokeStyle = '#22d3ee';
+        ctx.strokeStyle = '#0f766e';
+        ctx.fillStyle = 'rgba(15, 118, 110, 0.14)';
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(snapTarget.sx, snapTarget.sy, 10, 0, Math.PI * 2);
+        ctx.fill();
         ctx.stroke();
       } else if (snapTarget.kind === 'member_segment') {
         // Diamond T-junction split indicator
-        ctx.strokeStyle = '#f59e0b';
-        ctx.fillStyle = 'rgba(245, 158, 11, 0.25)';
+        ctx.strokeStyle = '#d97706';
+        ctx.fillStyle = 'rgba(217, 119, 6, 0.2)';
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(snapTarget.sx, snapTarget.sy - 8);
@@ -1466,15 +1475,15 @@ export class CanvasRenderer {
           `T-Split ${snapTarget.splitElementId} (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
           snapTarget.sx,
           snapTarget.sy - 20,
-          'rgba(120, 53, 15, 0.92)',
-          '#f59e0b',
-          '#fef3c7',
+          'rgba(255, 255, 255, 0.94)',
+          '#d97706',
+          '#b45309',
           '600 10px "JetBrains Mono", ui-monospace, monospace'
         );
       } else {
         // 0.1m Grid snap crosshair
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.75)';
-        ctx.lineWidth = 1.4;
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.moveTo(snapTarget.sx - 6, snapTarget.sy);
         ctx.lineTo(snapTarget.sx + 6, snapTarget.sy);
@@ -1489,9 +1498,9 @@ export class CanvasRenderer {
             `r=${pol.r.toFixed(2)}m, θ=${pol.thetaDeg.toFixed(1)}°`,
             snapTarget.sx + 58,
             snapTarget.sy + 18,
-            'rgba(15, 23, 42, 0.85)',
-            '#38bdf8',
-            '#bae6fd',
+            'rgba(255, 255, 255, 0.92)',
+            '#2563eb',
+            '#1d4ed8',
             '500 10px "JetBrains Mono", ui-monospace, monospace'
           );
         }
@@ -1502,9 +1511,9 @@ export class CanvasRenderer {
     // 3. Hover Probe glowing marker on member
     if (hoverProbe) {
       ctx.save();
-      ctx.fillStyle = '#38bdf8';
+      ctx.fillStyle = '#2563eb';
       ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 2.2;
       ctx.beginPath();
       ctx.arc(hoverProbe.screenX, hoverProbe.screenY, 5.5, 0, Math.PI * 2);
       ctx.fill();
@@ -1513,3 +1522,4 @@ export class CanvasRenderer {
     }
   }
 }
+
