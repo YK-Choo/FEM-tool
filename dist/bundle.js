@@ -251,7 +251,9 @@ function applyProps(
   isSvg         
 ) {
   const prevListeners                      = (dom       ).__listeners || {};
+  const handlersMap                      = (dom       ).__handlers || {};
   (dom       ).__listeners = prevListeners;
+  (dom       ).__handlers = handlersMap;
 
   for (const k of Object.keys(prevProps)) {
     if (k === 'children' || k === 'ref') continue;
@@ -267,6 +269,7 @@ function applyProps(
             : rawName === 'doubleclick'
               ? 'dblclick'
               : rawName;
+        delete handlersMap[evtName];
         if (prevListeners[evtName]) {
           dom.removeEventListener(evtName, prevListeners[evtName]);
           delete prevListeners[evtName];
@@ -304,12 +307,14 @@ function applyProps(
             ? 'dblclick'
             : rawName;
 
-      if (prevListeners[evtName] !== val) {
-        if (prevListeners[evtName]) {
-          dom.removeEventListener(evtName, prevListeners[evtName]);
-        }
-        prevListeners[evtName] = val;
-        dom.addEventListener(evtName, val);
+      handlersMap[evtName] = val;
+      if (!prevListeners[evtName]) {
+        const stableWrapper = (evt       ) => {
+          const fn = (dom       ).__handlers?.[evtName];
+          if (typeof fn === 'function') fn(evt);
+        };
+        prevListeners[evtName] = stableWrapper;
+        dom.addEventListener(evtName, stableWrapper);
       }
       continue;
     }
@@ -2120,9 +2125,9 @@ function cartesianToPolar(
  
 
 /**
- * Smart CAD cursor snapping:
- * 1. Snaps to existing nodes within nodeSnapPx (default 15px).
- * 2. Snaps along existing 1D member segments within segmentSnapPx (default 11px),
+ * Smart CAD cursor snapping (strictly in CSS pixels):
+ * 1. Snaps to existing nodes within nodeSnapPx (default 16 px CSS radius).
+ * 2. Snaps along existing 1D member segments within segmentSnapPx (default 12 px CSS distance),
  *    enabling automatic T-junction member splitting at mid-span connections.
  * 3. Snaps to the 0.1 m Cartesian grid.
  */
@@ -2132,8 +2137,8 @@ function computeSmartSnap(
   vp                   ,
   nodes                  ,
   elements                     ,
-  nodeSnapPx         = 15,
-  segmentSnapPx         = 11
+  nodeSnapPx         = 16,
+  segmentSnapPx         = 12
 )             {
   const nodeMap = new Map                        ();
   for (const n of nodes) nodeMap.set(n.id, n);
@@ -2534,11 +2539,16 @@ __modules.__mod_7 = (function() {
                  
                  
                  
+                
                
                      
                            
-const { worldToScreen,                        } = __modules.__mod_5;
-const { restraintsFromSupportPreset } = __modules.__mod_6;
+const { worldToScreen,                                         } = __modules.__mod_5;
+const {
+  computeCrossSection,
+  createMaterialFromPreset,
+  restraintsFromSupportPreset,
+} = __modules.__mod_6;
 
                                  
                           
@@ -2731,6 +2741,192 @@ function canAddMember(
     }
   }
   return { valid: true };
+}
+
+/**
+ * Add or resolve a StructuralNode at the given SnapResult:
+ * - If snap hits an existing node or a node already exists within 0.04 m of (snap.x, snap.y),
+ *   returns that existing nodeId without creating a duplicate (`created: false`).
+ * - If snap hits an existing member segment (or if (snap.x, snap.y) lies strictly mid-span on an
+ *   existing member), inserts a new StructuralNode and calls `splitMemberAtPoint` to split the
+ *   member into two connected sub-members sharing that node while preserving section/material
+ *   properties and splitting attached loads accurately (`created: true`, `splitElementId`).
+ * - Otherwise creates and appends a new standalone StructuralNode (`z = 0`) at (snap.x, snap.y).
+ */
+function addNodeAtSnap(
+  model                 ,
+  snap                                                                    
+)   
+                         
+                 
+                   
+                          
+  {
+  // 1. Existing node by ID
+  if (snap.kind === 'node' && snap.nodeId) {
+    const found = model.nodes.find((n) => n.id === snap.nodeId);
+    if (found) {
+      return { model, nodeId: found.id, created: false };
+    }
+  }
+
+  // 2. Existing node at exact/nearby coordinates (prevent duplicate nodes)
+  const existingCoordNode = model.nodes.find(
+    (n) => Math.hypot(n.x - snap.x, n.y - snap.y) < 0.04
+  );
+  if (existingCoordNode) {
+    return { model, nodeId: existingCoordNode.id, created: false };
+  }
+
+  // 3. Member segment split (either explicitly flagged by snap.splitElementId or lying mid-span on a member)
+  let targetSplitElementId                     =
+    snap.kind === 'member_segment' ? snap.splitElementId : undefined;
+
+  if (!targetSplitElementId || !model.elements.some((e) => e.id === targetSplitElementId)) {
+    targetSplitElementId = undefined;
+    const nodeMap = new Map(model.nodes.map((n) => [n.id, n]));
+    for (const el of model.elements) {
+      if (el.kind !== 'frame2d') continue;
+      const ni = nodeMap.get(el.nodeI);
+      const nj = nodeMap.get(el.nodeJ);
+      if (!ni || !nj) continue;
+      const dx = nj.x - ni.x;
+      const dy = nj.y - ni.y;
+      const lenSq = dx * dx + dy * dy;
+      if (lenSq < 1e-8) continue;
+      const t = ((snap.x - ni.x) * dx + (snap.y - ni.y) * dy) / lenSq;
+      if (t > 0.02 && t < 0.98) {
+        const projX = ni.x + t * dx;
+        const projY = ni.y + t * dy;
+        if (Math.hypot(snap.x - projX, snap.y - projY) < 0.04) {
+          targetSplitElementId = el.id;
+          break;
+        }
+      }
+    }
+  }
+
+  if (targetSplitElementId) {
+    const splitRes = splitMemberAtPoint(model, targetSplitElementId, snap.x, snap.y);
+    return {
+      model: splitRes.model,
+      nodeId: splitRes.newNodeId,
+      created: true,
+      splitElementId: targetSplitElementId,
+    };
+  }
+
+  // 4. Standalone node on the 0.1 m Cartesian grid
+  const newNodeId = nextEntityId(
+    'N',
+    model.nodes.map((n) => n.id)
+  );
+  const newNode                 = {
+    id: newNodeId,
+    label: newNodeId,
+    x: Number(snap.x.toFixed(4)),
+    y: Number(snap.y.toFixed(4)),
+    z: 0,
+    support: 'none',
+    restraints: restraintsFromSupportPreset('none'),
+    springs: { kx: 0, ky: 0, kz: 0, krx: 0, kry: 0, krz: 0 },
+  };
+
+  return {
+    model: {
+      ...model,
+      nodes: [...model.nodes, newNode],
+    },
+    nodeId: newNodeId,
+    created: true,
+  };
+}
+
+/**
+ * Append a new Frame2DElement connecting `startNodeId` and `endNodeId` with default
+ * IPE 360 Steel section/material properties after validating with `canAddMember`.
+ */
+function addMemberBetweenNodes(
+  model                 ,
+  startNodeId        ,
+  endNodeId        
+)   
+                         
+                           
+                  
+  {
+  const check = canAddMember(model, startNodeId, endNodeId);
+  if (!check.valid) {
+    return { model, elementId: null, reason: check.reason };
+  }
+
+  const newElId = nextEntityId(
+    'M',
+    model.elements.map((e) => e.id)
+  );
+  const defaultSec = computeCrossSection('i_section', {
+    h: 360,
+    b: 170,
+    tw: 8.0,
+    tf: 12.7,
+  });
+  const defaultMat = createMaterialFromPreset('steel');
+
+  const newEl                 = {
+    id: newElId,
+    kind: 'frame2d',
+    label: `Member ${newElId}`,
+    nodeI: startNodeId,
+    nodeJ: endNodeId,
+    section: defaultSec,
+    material: defaultMat,
+    releaseStart: false,
+    releaseEnd: false,
+  };
+
+  return {
+    model: {
+      ...model,
+      elements: [...model.elements, newEl],
+    },
+    elementId: newElId,
+  };
+}
+
+/**
+ * Cycle a node's support restraint (`pinned` -> `fixed` -> `rollerX` -> `rollerY` -> `none`)
+ * or apply `explicitSupport` if provided, updating its 3D DOF restraints.
+ */
+function cycleNodeSupport(
+  model                 ,
+  nodeId        ,
+  explicitSupport                
+)                                                         {
+  const order                  = ['pinned', 'fixed', 'rollerX', 'rollerY', 'none'];
+  let assigned                = explicitSupport ?? 'pinned';
+
+  const nextNodes = model.nodes.map((n) => {
+    if (n.id !== nodeId) return n;
+    if (explicitSupport) {
+      assigned = explicitSupport;
+    } else {
+      const curIdx = order.indexOf(n.support);
+      assigned = order[(curIdx + 1) % order.length];
+    }
+    return {
+      ...n,
+      support: assigned,
+      restraints: restraintsFromSupportPreset(assigned),
+    };
+  });
+
+  return {
+    model: {
+      ...model,
+      nodes: nextNodes,
+    },
+    nextSupport: assigned,
+  };
 }
 
 /**
@@ -3017,6 +3213,9 @@ function probeMemberAtCursor(
   __exports.nextEntityId = nextEntityId;
   __exports.splitMemberAtPoint = splitMemberAtPoint;
   __exports.canAddMember = canAddMember;
+  __exports.addNodeAtSnap = addNodeAtSnap;
+  __exports.addMemberBetweenNodes = addMemberBetweenNodes;
+  __exports.cycleNodeSupport = cycleNodeSupport;
   __exports.findNodeWithinRadius = findNodeWithinRadius;
   __exports.hitTestAllCanvasEntities = hitTestAllCanvasEntities;
   __exports.hitTestCanvas = hitTestCanvas;
@@ -3088,7 +3287,14 @@ const {
  
 
                                          
-                                                                                                            
+             
+              
+                
+                   
+                      
+                      
+                       
+               
                                 
                                    
                                 
@@ -3337,6 +3543,41 @@ class CanvasRenderer {
     return typeof offscreenCanvas.toDataURL === 'function'
       ? offscreenCanvas.toDataURL('image/png')
       : '';
+  }
+
+  /**
+   * Render onto a live HTMLCanvasElement while isolating `devicePixelRatio` backing-store
+   * scaling strictly inside CanvasRenderer so all UI/pointer coordinates remain in CSS pixels.
+   */
+         renderToCanvas(
+    canvas                   ,
+    vp                   ,
+    model                 ,
+    solverOutput              ,
+    layers                    ,
+    interaction                        
+  )                     {
+    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const targetW = Math.max(1, Math.round(vp.width * dpr));
+    const targetH = Math.max(1, Math.round(vp.height * dpr));
+
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return [];
+
+    ctx.save();
+    if (typeof ctx.setTransform === 'function') {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    } else {
+      ctx.scale(dpr, dpr);
+    }
+    const handles = this.render(ctx, vp, model, solverOutput, layers, interaction);
+    ctx.restore();
+    return handles;
   }
 
          render(
@@ -4474,50 +4715,93 @@ class CanvasRenderer {
       ctx.restore();
     }
 
-    // 2. Smart Snap cursor indicator
-    if (snapTarget && activeTool !== 'select') {
+    // 2. Clear Visual Hover Snap Indicators:
+    // - Always draw a distinct highlight ring + crosshair whenever cursor hovers near an
+    //   existing node (< 16 px CSS radius) or an existing member segment (< 12 px CSS distance)
+    // - Also draw the 0.1 m grid snap crosshair + ring when Add Node or Draw Member is active
+    if (snapTarget) {
       ctx.save();
       if (snapTarget.kind === 'node') {
         ctx.strokeStyle = '#0f766e';
-        ctx.fillStyle = 'rgba(15, 118, 110, 0.14)';
-        ctx.lineWidth = 2;
+        ctx.fillStyle = 'rgba(15, 118, 110, 0.16)';
+        ctx.lineWidth = 2.2;
         ctx.beginPath();
-        ctx.arc(snapTarget.sx, snapTarget.sy, 10, 0, Math.PI * 2);
+        ctx.arc(snapTarget.sx, snapTarget.sy, 11, 0, Math.PI * 2);
         ctx.fill();
         ctx.stroke();
+
+        // Precision crosshair ticks around hovered node
+        ctx.beginPath();
+        ctx.moveTo(snapTarget.sx - 15, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx - 7, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx + 7, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx + 15, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy - 15);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy - 7);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy + 7);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy + 15);
+        ctx.stroke();
+
+        if (activeTool !== 'select') {
+          drawRoundedBadge(
+            ctx,
+            `Snap Node ${snapTarget.nodeId} (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
+            snapTarget.sx,
+            snapTarget.sy - 22,
+            'rgba(255, 255, 255, 0.94)',
+            '#0f766e',
+            '#0f766e',
+            '600 10px "JetBrains Mono", ui-monospace, monospace'
+          );
+        }
       } else if (snapTarget.kind === 'member_segment') {
-        // Diamond T-junction split indicator
+        // Diamond + crosshair mid-member snap / T-junction split indicator (< 12 px CSS distance)
         ctx.strokeStyle = '#d97706';
-        ctx.fillStyle = 'rgba(217, 119, 6, 0.2)';
+        ctx.fillStyle = 'rgba(217, 119, 6, 0.22)';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(snapTarget.sx, snapTarget.sy - 8);
-        ctx.lineTo(snapTarget.sx + 8, snapTarget.sy);
-        ctx.lineTo(snapTarget.sx, snapTarget.sy + 8);
-        ctx.lineTo(snapTarget.sx - 8, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy - 9);
+        ctx.lineTo(snapTarget.sx + 9, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy + 9);
+        ctx.lineTo(snapTarget.sx - 9, snapTarget.sy);
         ctx.closePath();
         ctx.fill();
         ctx.stroke();
 
-        drawRoundedBadge(
-          ctx,
-          `T-Split ${snapTarget.splitElementId} (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
-          snapTarget.sx,
-          snapTarget.sy - 20,
-          'rgba(255, 255, 255, 0.94)',
-          '#d97706',
-          '#b45309',
-          '600 10px "JetBrains Mono", ui-monospace, monospace'
-        );
-      } else {
-        // 0.1m Grid snap crosshair
-        ctx.strokeStyle = '#2563eb';
-        ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.moveTo(snapTarget.sx - 6, snapTarget.sy);
-        ctx.lineTo(snapTarget.sx + 6, snapTarget.sy);
-        ctx.moveTo(snapTarget.sx, snapTarget.sy - 6);
-        ctx.lineTo(snapTarget.sx, snapTarget.sy + 6);
+        ctx.moveTo(snapTarget.sx - 13, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx + 13, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy - 13);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy + 13);
+        ctx.stroke();
+
+        if (activeTool === 'add_node' || activeTool === 'draw_member') {
+          drawRoundedBadge(
+            ctx,
+            `Split ${snapTarget.splitElementId} (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
+            snapTarget.sx,
+            snapTarget.sy - 22,
+            'rgba(255, 255, 255, 0.94)',
+            '#d97706',
+            '#b45309',
+            '600 10px "JetBrains Mono", ui-monospace, monospace'
+          );
+        }
+      } else if (activeTool === 'add_node' || activeTool === 'draw_member') {
+        // 0.1m Grid snap ring + crosshair for Add Node and Draw Member
+        ctx.strokeStyle = '#2563eb';
+        ctx.fillStyle = 'rgba(37, 99, 235, 0.12)';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.arc(snapTarget.sx, snapTarget.sy, 6.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(snapTarget.sx - 10, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx + 10, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy - 10);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy + 10);
         ctx.stroke();
 
         if (vp.coordSystem === 'polar') {
@@ -4531,6 +4815,17 @@ class CanvasRenderer {
             '#2563eb',
             '#1d4ed8',
             '500 10px "JetBrains Mono", ui-monospace, monospace'
+          );
+        } else if (activeTool === 'add_node') {
+          drawRoundedBadge(
+            ctx,
+            `+Node (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
+            snapTarget.sx,
+            snapTarget.sy - 20,
+            'rgba(255, 255, 255, 0.94)',
+            '#2563eb',
+            '#1d4ed8',
+            '600 10px "JetBrains Mono", ui-monospace, monospace'
           );
         }
       }
@@ -5341,6 +5636,17 @@ const FolderOpen = createLucideIcon([
   },
 ]);
 
+const PlusCircle = createLucideIcon([
+  { tag: 'circle', attrs: { cx: '12', cy: '12', r: '10' } },
+  { tag: 'line', attrs: { x1: '12', y1: '8', x2: '12', y2: '16' } },
+  { tag: 'line', attrs: { x1: '8', y1: '12', x2: '16', y2: '12' } },
+]);
+
+const Dot = createLucideIcon([
+  { tag: 'circle', attrs: { cx: '12.1', cy: '12.1', r: '1' } },
+]);
+
+
 
 
 
@@ -5374,6 +5680,8 @@ const FolderOpen = createLucideIcon([
   __exports.FilePlus = FilePlus;
   __exports.PlusSquare = PlusSquare;
   __exports.FolderOpen = FolderOpen;
+  __exports.PlusCircle = PlusCircle;
+  __exports.Dot = Dot;
   return __exports;
 })();
 
@@ -5403,10 +5711,12 @@ const {
   AlertTriangle,
   CheckCircle2,
   Boxes,
+  PlusCircle,
 } = __modules.__mod_10;
 
                             
             
+              
                  
                     
                     
@@ -5462,6 +5772,7 @@ function Toolbar({
               
      = [
     { id: 'select', label: 'Select / Inspect', shortcut: 'V', icon: MousePointer },
+    { id: 'add_node', label: 'Add Node', shortcut: 'A', icon: PlusCircle },
     { id: 'draw_member', label: 'Draw Member', shortcut: 'M', icon: PenTool },
     { id: 'assign_support', label: 'Assign Support', shortcut: 'S', icon: Anchor },
     { id: 'add_nodal_load', label: 'Nodal Load', shortcut: 'N', icon: ArrowDownToDot },
@@ -6288,8 +6599,6 @@ __modules.__mod_15 = (function() {
 const {
   analyzeStructure,
   computeCrossSection,
-  createMaterialFromPreset,
-  restraintsFromSupportPreset,
 } = __modules.__mod_4;
 const {
   computeSmartSnap,
@@ -6302,8 +6611,9 @@ const {
   hitTestAllCanvasEntities,
   findNodeWithinRadius,
   probeMemberAtCursor,
-  splitMemberAtPoint,
-  canAddMember,
+  addNodeAtSnap,
+  addMemberBetweenNodes,
+  cycleNodeSupport,
   nextEntityId,
                       
 } = __modules.__mod_7;
@@ -6478,8 +6788,7 @@ const rendererInstance = new CanvasRenderer();
                         
             
             
-                  
-                          
+                 
   
 
 function App() {
@@ -6493,7 +6802,7 @@ function App() {
 
   const [activeTool, setActiveTool] = React.useState                ('select');
   const [selectedNodeId, setSelectedNodeId] = React.useState               (null);
-  const [selectedElementId, setSelectedElementId] = React.useState               ('M1');
+  const [selectedElementId, setSelectedElementId] = React.useState               (null);
   const [selectedLoadId, setSelectedLoadId] = React.useState               (null);
   const [hoveredElementId, setHoveredElementId] = React.useState               (null);
 
@@ -6534,6 +6843,7 @@ function App() {
   const canvasRef = React.useRef                          (null);
   const containerRef = React.useRef                       (null);
   const loadHandlesRef = React.useRef                    ([]);
+  const isSpacePressedRef = React.useRef         (false);
 
   // Synchronized mutable refs to prevent stale React state closures in pointer/mouse event handlers
   const modelRef = React.useRef                 (model);
@@ -6589,7 +6899,7 @@ function App() {
   const updateModelWithHistory = (
     updater                                            ,
     recordUndo          = true
-  ) => {
+  )                  => {
     const prev = modelRef.current;
     const next = updater(structuredClone(prev));
     modelRef.current = next;
@@ -6598,6 +6908,7 @@ function App() {
       setRedoStack([]);
     }
     setModel(next);
+    return next;
   };
 
   const handleUndo = () => {
@@ -6607,6 +6918,7 @@ function App() {
     setRedoStack((r) => [...r, modelRef.current]);
     modelRef.current = prevModel;
     setModel(prevModel);
+    setDrawStartPoint(null);
   };
 
   const handleRedo = () => {
@@ -6616,14 +6928,15 @@ function App() {
     setUndoStack((u) => [...u, modelRef.current]);
     modelRef.current = nextModel;
     setModel(nextModel);
+    setDrawStartPoint(null);
   };
 
   // Fit structure to usable canvas area (excluding top toolbar height & open right-hand Sensitivity Panel width)
   const fitNodesToUsableCanvas = (nodesToFit                  ) => {
     const el = containerRef.current;
     const rect = el ? el.getBoundingClientRect() : null;
-    const usableW = rect && rect.width > 0 ? rect.width : viewportRef.current.width;
-    const usableH = rect && rect.height > 0 ? rect.height : viewportRef.current.height;
+    const usableW = rect && rect.width > 0 ? Math.round(rect.width) : viewportRef.current.width;
+    const usableH = rect && rect.height > 0 ? Math.round(rect.height) : viewportRef.current.height;
     setViewport((vp) => fitModelToViewport(nodesToFit, usableW, usableH, vp));
   };
 
@@ -6643,6 +6956,12 @@ function App() {
     }
   };
 
+  const clearSelection = () => {
+    setSelectedNodeId(null);
+    setSelectedElementId(null);
+    setSelectedLoadId(null);
+  };
+
   const handleSelectPreset = (presetId        ) => {
     const found = BENCHMARK_PRESETS.find((p) => p.id === presetId);
     if (!found) return;
@@ -6652,9 +6971,7 @@ function App() {
     setRedoStack([]);
     modelRef.current = freshModel;
     setModel(freshModel);
-    setSelectedNodeId(null);
-    setSelectedElementId(freshModel.elements[0]?.id ?? null);
-    setSelectedLoadId(null);
+    clearSelection();
     setDrawStartPoint(null);
     setPinnedParams(buildDefaultPinsForPreset(presetId, freshModel));
 
@@ -6692,11 +7009,10 @@ function App() {
       elements: [],
       loads: [],
     };
+    setActivePresetId('blank');
     updateModelWithHistory(() => blankModel, true);
     setPinnedParams([]);
-    setSelectedNodeId(null);
-    setSelectedElementId(null);
-    setSelectedLoadId(null);
+    clearSelection();
     setDrawStartPoint(null);
     setHoverProbe(null);
     setViewport((vp) => ({ ...vp, coordSystem: 'cartesian' }));
@@ -6704,28 +7020,55 @@ function App() {
     showToast('Cleared workspace to new 0.1 m Cartesian project (Ctrl+Z to undo).');
   };
 
-  // Fit viewport on mount and container resize
+  // Keep viewport.width & viewport.height synchronized with the usable canvas container CSS size
   React.useEffect(() => {
-    const updateSize = () => {
-      const el = containerRef.current;
-      if (!el) return;
+    const el = containerRef.current;
+    if (!el) return;
+
+    let initializedFit = false;
+    const syncContainerSize = () => {
       const rect = el.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        setViewport((vp) =>
-          fitModelToViewport(modelRef.current.nodes, rect.width, rect.height, vp)
-        );
+      const cssW = Math.round(rect.width);
+      const cssH = Math.round(rect.height);
+      if (cssW > 0 && cssH > 0) {
+        if (!initializedFit) {
+          initializedFit = true;
+          setViewport((vp) => fitModelToViewport(modelRef.current.nodes, cssW, cssH, vp));
+        } else {
+          setViewport((vp) =>
+            vp.width === cssW && vp.height === cssH
+              ? vp
+              : { ...vp, width: cssW, height: cssH }
+          );
+        }
       }
     };
-    updateSize();
-    window.addEventListener('resize', updateSize);
-    return () => window.removeEventListener('resize', updateSize);
+
+    syncContainerSize();
+    window.addEventListener('resize', syncContainerSize);
+
+    let ro                        = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => syncContainerSize());
+      ro.observe(el);
+    }
+
+    return () => {
+      window.removeEventListener('resize', syncContainerSize);
+      if (ro) ro.disconnect();
+    };
   }, []);
 
-  // Keyboard shortcuts (Ctrl+Z, Ctrl+Y, Delete, Escape, V/M/S/N/L tool keys)
+  // Keyboard shortcuts (Ctrl+Z, Ctrl+Y, Spacebar pan modifier, Delete, Escape, V/A/M/S/N/L tool keys)
   React.useEffect(() => {
     const onKeyDown = (e               ) => {
       const tag = (e.target               )?.tagName;
       if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+
+      if (e.code === 'Space') {
+        isSpacePressedRef.current = true;
+        return;
+      }
 
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
@@ -6739,10 +7082,12 @@ function App() {
         return;
       }
       if (e.key === 'Escape') {
-        setDrawStartPoint(null);
-        setSelectedNodeId(null);
-        setSelectedElementId(null);
-        setSelectedLoadId(null);
+        if (drawStartPointRef.current) {
+          setDrawStartPoint(null);
+          showToast('Cancelled active Draw Member draft segment.');
+          return;
+        }
+        clearSelection();
         setActiveTool('select');
         return;
       }
@@ -6751,47 +7096,67 @@ function App() {
         return;
       }
       const key = e.key.toLowerCase();
-      if (key === 'v') setActiveTool('select');
-      else if (key === 'm') setActiveTool('draw_member');
-      else if (key === 's') setActiveTool('assign_support');
-      else if (key === 'n') setActiveTool('add_nodal_load');
-      else if (key === 'l') setActiveTool('add_member_load');
+      if (key === 'v') {
+        setActiveTool('select');
+        setDrawStartPoint(null);
+      } else if (key === 'a') {
+        setActiveTool('add_node');
+        setDrawStartPoint(null);
+        clearSelection();
+      } else if (key === 'm') {
+        setActiveTool('draw_member');
+        setDrawStartPoint(null);
+        clearSelection();
+      } else if (key === 's') {
+        setActiveTool('assign_support');
+        setDrawStartPoint(null);
+        clearSelection();
+      } else if (key === 'n') {
+        setActiveTool('add_nodal_load');
+        setDrawStartPoint(null);
+      } else if (key === 'l') {
+        setActiveTool('add_member_load');
+        setDrawStartPoint(null);
+      }
     };
+
+    const onKeyUp = (e               ) => {
+      if (e.code === 'Space') {
+        isSpacePressedRef.current = false;
+      }
+    };
+
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
   }, [undoStack, redoStack, model, selectedNodeId, selectedElementId, selectedLoadId]);
 
-  // Render HTML5 Canvas with crisp devicePixelRatio scaling on state changes
+  // Render HTML5 Canvas with devicePixelRatio scaling isolated inside CanvasRenderer.renderToCanvas
   React.useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
-    const targetW = Math.max(1, Math.floor(viewport.width * dpr));
-    const targetH = Math.max(1, Math.floor(viewport.height * dpr));
 
-    if (canvas.width !== targetW || canvas.height !== targetH) {
-      canvas.width = targetW;
-      canvas.height = targetH;
-    }
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.save();
-    ctx.scale(dpr, dpr);
-
-    const handles = rendererInstance.render(ctx, viewport, model, solverOutput, layers, {
-      activeTool,
-      selectedNodeId,
-      selectedElementId,
-      selectedLoadId,
-      hoveredElementId,
-      snapTarget,
-      drawStartPoint,
-      hoverProbe,
-    });
+    const handles = rendererInstance.renderToCanvas(
+      canvas,
+      viewport,
+      model,
+      solverOutput,
+      layers,
+      {
+        activeTool,
+        selectedNodeId,
+        selectedElementId,
+        selectedLoadId,
+        hoveredElementId,
+        snapTarget,
+        drawStartPoint,
+        hoverProbe,
+      }
+    );
     loadHandlesRef.current = handles;
-
-    ctx.restore();
   }, [
     viewport,
     model,
@@ -6863,175 +7228,38 @@ function App() {
     else if (selectedNodeId) handleDeleteEntityById('node', selectedNodeId);
   };
 
-  // Resolve a SnapResult into an existing or newly created/split Node ID inside `workingModel`
-  const resolveSnapPointToNode = (
-    workingModel                 ,
-    snap            
-  )                                             => {
-    // 1. Reuse existing node if snap.nodeId is present and valid
-    if (snap.kind === 'node' && snap.nodeId) {
-      const exists = workingModel.nodes.find((n) => n.id === snap.nodeId);
-      if (exists) {
-        return { model: workingModel, nodeId: exists.id };
-      }
-    }
-
-    // 2. Check if any existing node is already at (snap.x, snap.y)
-    const existingAtCoord = workingModel.nodes.find(
-      (n) => Math.hypot(n.x - snap.x, n.y - snap.y) < 0.04
-    );
-    if (existingAtCoord) {
-      return { model: workingModel, nodeId: existingAtCoord.id };
-    }
-
-    // 3. Auto-split existing member at mid-span intersection
-    if (snap.kind === 'member_segment' && snap.splitElementId) {
-      let targetElId                     = snap.splitElementId;
-      if (!workingModel.elements.some((e) => e.id === targetElId)) {
-        // If the start point already split this member, find which sub-member contains (snap.x, snap.y)
-        const nodeMap = new Map(workingModel.nodes.map((n) => [n.id, n]));
-        for (const el of workingModel.elements) {
-          if (el.kind !== 'frame2d') continue;
-          const ni = nodeMap.get(el.nodeI);
-          const nj = nodeMap.get(el.nodeJ);
-          if (!ni || !nj) continue;
-          const dx = nj.x - ni.x;
-          const dy = nj.y - ni.y;
-          const lenSq = dx * dx + dy * dy;
-          if (lenSq < 1e-9) continue;
-          const t = ((snap.x - ni.x) * dx + (snap.y - ni.y) * dy) / lenSq;
-          if (t > 0.02 && t < 0.98) {
-            const projX = ni.x + t * dx;
-            const projY = ni.y + t * dy;
-            if (Math.hypot(snap.x - projX, snap.y - projY) < 0.05) {
-              targetElId = el.id;
-              break;
-            }
-          }
-        }
-      }
-      if (targetElId && workingModel.elements.some((e) => e.id === targetElId)) {
-        const splitRes = splitMemberAtPoint(
-          workingModel,
-          targetElId,
-          snap.x,
-          snap.y
-        );
-        showToast(`Split member ${targetElId} at node ${splitRes.newNodeId} (${snap.x}m, ${snap.y}m)`);
-        return { model: splitRes.model, nodeId: splitRes.newNodeId };
-      }
-    }
-
-    // 4. Create and append a new StructuralNode (z = 0) at the 0.1 m grid coordinate
-    const newNodeId = nextEntityId(
-      'N',
-      workingModel.nodes.map((n) => n.id)
-    );
-    const newNode                 = {
-      id: newNodeId,
-      label: newNodeId,
-      x: snap.x,
-      y: snap.y,
-      z: 0,
-      support: 'none',
-      restraints: restraintsFromSupportPreset('none'),
-      springs: { kx: 0, ky: 0, kz: 0, krx: 0, kry: 0, krz: 0 },
-    };
-    return {
-      model: { ...workingModel, nodes: [...workingModel.nodes, newNode] },
-      nodeId: newNodeId,
-    };
-  };
-
-  // Complete drawing a member from startSnap to endSnap
-  const completeDrawMember = (
-    startSnap                 ,
-    endSnap            
-  ) => {
-    if (Math.hypot(endSnap.x - startSnap.x, endSnap.y - startSnap.y) < 0.05) {
-      return;
-    }
-
-    let createdElementId                = null;
-
-    updateModelWithHistory((prev) => {
-      let working = prev;
-      const startRes = resolveSnapPointToNode(working, {
-        x: startSnap.x,
-        y: startSnap.y,
-        sx: 0,
-        sy: 0,
-        kind: startSnap.nodeId
-          ? 'node'
-          : startSnap.splitElementId
-            ? 'member_segment'
-            : 'grid',
-        nodeId: startSnap.nodeId,
-        splitElementId: startSnap.splitElementId,
-      });
-      working = startRes.model;
-
-      const endRes = resolveSnapPointToNode(working, endSnap);
-      working = endRes.model;
-
-      const check = canAddMember(working, startRes.nodeId, endRes.nodeId);
-      if (!check.valid) {
-        if (check.reason) showToast(check.reason);
-        return prev;
-      }
-
-      const newElId = nextEntityId(
-        'M',
-        working.elements.map((e) => e.id)
-      );
-      const defaultSec = computeCrossSection('i_section', {
-        h: 360,
-        b: 170,
-        tw: 8.0,
-        tf: 12.7,
-      });
-      const defaultMat = createMaterialFromPreset('steel');
-
-      const newEl                 = {
-        id: newElId,
-        kind: 'frame2d',
-        label: `Member ${newElId}`,
-        nodeI: startRes.nodeId,
-        nodeJ: endRes.nodeId,
-        section: defaultSec,
-        material: defaultMat,
-        releaseStart: false,
-        releaseEnd: false,
-      };
-
-      createdElementId = newElId;
-
-      return {
-        ...working,
-        elements: [...working.elements, newEl],
-      };
-    });
-
-    if (createdElementId) {
-      setSelectedNodeId(null);
-      setSelectedLoadId(null);
-      setSelectedElementId(createdElementId);
-    }
-  };
-
-  // Canvas Mouse / Pointer Handlers
-  const handleCanvasMouseDown = (e     ) => {
+  // Extract strictly unscaled CSS pixel coordinates relative to the <canvas> top-left corner
+  const getCanvasCssCoords = (e                                      ) => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
+    return {
+      sx: e.clientX - rect.left,
+      sy: e.clientY - rect.top,
+    };
+  };
+
+  // Canvas Mouse / Pointer Handlers (strictly in CSS pixels; never uses setPointerCapture)
+  const handleCanvasMouseDown = (e     ) => {
+    const coords = getCanvasCssCoords(e);
+    if (!coords) return;
+    const { sx, sy } = coords;
     const currentVp = viewportRef.current;
     const currentModel = modelRef.current;
     const currentTool = activeToolRef.current;
 
-    // Middle mouse button or right mouse button -> pan
-    if (e.button === 1 || e.button === 2) {
+    // Right-click (button === 2): cancel active Draw Member draft segment if present
+    if (e.button === 2) {
+      e.preventDefault();
+      if (drawStartPointRef.current) {
+        setDrawStartPoint(null);
+        showToast('Cancelled active Draw Member draft segment.');
+      }
+      return;
+    }
+
+    // Middle-mouse drag (button === 1) OR Space + left-drag -> camera pan
+    if (e.button === 1 || (isSpacePressedRef.current && e.button === 0)) {
       e.preventDefault();
       panDragRef.current = {
         active: true,
@@ -7044,84 +7272,130 @@ function App() {
       return;
     }
 
+    // Only process primary left-button clicks for active CAD tools
+    if (e.button !== 0) return;
+
     const currentSnap = computeSmartSnap(
       sx,
       sy,
       currentVp,
       currentModel.nodes,
-      currentModel.elements
+      currentModel.elements,
+      16,
+      12
     );
     setSnapTarget(currentSnap);
 
-    // 1. Draw Member Tool: supports both Two-Click (click start -> move -> click end)
-    // and Click-and-Drag (mousedown start -> drag -> mouseup end)
-    if (currentTool === 'draw_member') {
-      const activeStart = drawStartPointRef.current;
-      if (!activeStart) {
-        setDrawStartPoint({
-          x: currentSnap.x,
-          y: currentSnap.y,
-          nodeId: currentSnap.nodeId,
-          splitElementId: currentSnap.splitElementId,
-        });
+    // 1. Explicit "Add Node" Tool:
+    // - Click on Empty Canvas: snaps to 0.1 m grid (without duplicating existing nodes) & creates StructuralNode (z = 0).
+    // - Click on Existing Member: snaps onto member segment, inserts StructuralNode, and calls splitMemberAtPoint.
+    if (currentTool === 'add_node') {
+      let resultNodeId = '';
+      let wasCreated = false;
+      let splitId                    ;
+
+      updateModelWithHistory((prev) => {
+        const res = addNodeAtSnap(prev, currentSnap);
+        resultNodeId = res.nodeId;
+        wasCreated = res.created;
+        splitId = res.splitElementId;
+        return res.model;
+      });
+
+      if (wasCreated && splitId) {
+        showToast(
+          `Inserted Node ${resultNodeId} and split Member ${splitId} at (${currentSnap.x.toFixed(1)} m, ${currentSnap.y.toFixed(1)} m)`
+        );
+      } else if (wasCreated) {
+        showToast(
+          `Added Node ${resultNodeId} at (${currentSnap.x.toFixed(1)} m, ${currentSnap.y.toFixed(1)} m)`
+        );
       } else {
-        completeDrawMember(activeStart, currentSnap);
-        setDrawStartPoint(null);
+        showToast(
+          `Node ${resultNodeId} already exists at (${currentSnap.x.toFixed(1)} m, ${currentSnap.y.toFixed(1)} m)`
+        );
       }
       return;
     }
 
-    // 2. Assign Support Tool: generous 16 px screen-space node hit radius via worldToScreen
+    // 2. "Draw Member" Tool:
+    // - Clicking start point resolves/auto-creates start node synchronously and locks drawStartPoint.
+    // - Clicking end point resolves/creates/splits end node synchronously and creates the frame2d member.
+    if (currentTool === 'draw_member') {
+      const activeStart = drawStartPointRef.current;
+      if (!activeStart) {
+        let startNode                            ;
+        updateModelWithHistory((prev) => {
+          const res = addNodeAtSnap(prev, currentSnap);
+          startNode = res.model.nodes.find((n) => n.id === res.nodeId);
+          return res.model;
+        });
+        if (startNode) {
+          setDrawStartPoint({
+            x: startNode.x,
+            y: startNode.y,
+            nodeId: startNode.id,
+          });
+        }
+      } else {
+        if (Math.hypot(currentSnap.x - activeStart.x, currentSnap.y - activeStart.y) < 0.05) {
+          return;
+        }
+        let createdElId                = null;
+        let failReason                    ;
+        updateModelWithHistory((prev) => {
+          const endRes = addNodeAtSnap(prev, currentSnap);
+          const memRes = addMemberBetweenNodes(endRes.model, activeStart.nodeId, endRes.nodeId);
+          createdElId = memRes.elementId;
+          failReason = memRes.reason;
+          return memRes.model;
+        });
+        setDrawStartPoint(null);
+        if (createdElId) {
+          showToast(`Created Member ${createdElId}`);
+        } else if (failReason) {
+          showToast(failReason);
+        }
+      }
+      return;
+    }
+
+    // 3. "Assign Support" Tool:
+    // Clicking within 16 px (CSS pixels) of any node immediately cycles its support type
+    // (pinned -> fixed -> rollerX -> rollerY -> none) and triggers solver recalculation.
     if (currentTool === 'assign_support') {
       const nodeHit = findNodeWithinRadius(sx, sy, currentVp, currentModel.nodes, 16);
       if (nodeHit) {
         const targetNodeId = nodeHit.node.id;
-        const order                              = [
-          'pinned',
-          'fixed',
-          'rollerX',
-          'rollerY',
-          'none',
-        ];
-        let assignedSupport                            = 'pinned';
-        updateModelWithHistory((prev) => ({
-          ...prev,
-          nodes: prev.nodes.map((n) => {
-            if (n.id !== targetNodeId) return n;
-            const curIdx = order.indexOf(n.support);
-            const nextSup = order[(curIdx + 1) % order.length];
-            assignedSupport = nextSup;
-            return {
-              ...n,
-              support: nextSup,
-              restraints: restraintsFromSupportPreset(nextSup),
-            };
-          }),
-        }));
-        setSelectedNodeId(targetNodeId);
-        setSelectedElementId(null);
-        setSelectedLoadId(null);
+        let assignedSupport = nodeHit.node.support;
+        updateModelWithHistory((prev) => {
+          const res = cycleNodeSupport(prev, targetNodeId);
+          assignedSupport = res.nextSupport;
+          return res.model;
+        });
         showToast(`Node ${targetNodeId} support → ${assignedSupport}`);
       } else {
-        showToast('Click within 16 px of any node to assign or cycle its support restraint.');
+        showToast('Click within 16 px of any node to cycle its support (Pinned → Fixed → Roller X → Roller Y → None).');
       }
       return;
     }
 
-    // 3. Add Nodal Load Tool: generous 16 px screen-space node hit radius
+    // 4. "Add Nodal Load" Tool:
+    // Clicking within 16 px (CSS pixels) of any node attaches a point load/moment to that nodeId
+    // and opens its parameters cleanly.
     if (currentTool === 'add_nodal_load') {
       const nodeHit = findNodeWithinRadius(sx, sy, currentVp, currentModel.nodes, 16);
       if (nodeHit) {
         handleQuickAddNodalLoad(nodeHit.node.id);
       } else {
-        showToast('Click any node to apply a concentrated Nodal Load (Fx, Fy, Mz).');
+        showToast('Click within 16 px of any node to apply a concentrated Nodal Load (Fx, Fy, Mz).');
       }
       return;
     }
 
     const hit = hitTestCanvas(sx, sy, currentVp, currentModel, loadHandlesRef.current);
 
-    // 4. Delete Tool
+    // 5. "Delete" Tool
     if (currentTool === 'delete') {
       if (hit) {
         handleDeleteEntityById(
@@ -7132,7 +7406,7 @@ function App() {
       return;
     }
 
-    // 5. Add Member Load Tool
+    // 6. "Add Member Load" Tool
     if (currentTool === 'add_member_load') {
       if (hit && hit.kind === 'member') {
         handleQuickAddMemberLoad(hit.elementId, 'distributed');
@@ -7142,8 +7416,10 @@ function App() {
       return;
     }
 
-    // 6. Select / Inspect Tool: support Click-Through Cycling within 8 px over busy nodes!
-    // Cycle order: Node -> Nodal Load #1 -> Nodal Load #2 (etc.) -> Connected Member(s) -> back to Node
+    // 7. "Select / Inspect" Tool:
+    // - If clicking an entity, support Click-Through Cycling within 8 px over busy nodes:
+    //   Node -> Nodal Load #1 -> Nodal Load #2 (etc.) -> Connected Member(s) -> back to Node
+    // - Only if clicking on empty space in Select mode, arm camera pan (with 6 px drag threshold)
     const allHits = hitTestAllCanvasEntities(
       sx,
       sy,
@@ -7186,25 +7462,26 @@ function App() {
   };
 
   const handleCanvasMouseMove = (e     ) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
+    const coords = getCanvasCssCoords(e);
+    if (!coords) return;
+    const { sx, sy } = coords;
     const currentVp = viewportRef.current;
     const currentModel = modelRef.current;
 
     if (panDragRef.current.active) {
       const dx = sx - panDragRef.current.startSx;
       const dy = sy - panDragRef.current.startSy;
-      if (Math.hypot(dx, dy) > 3) {
+      // Enforce 6 px drag threshold before panning
+      if (!panDragRef.current.moved && Math.hypot(dx, dy) >= 6) {
         panDragRef.current.moved = true;
       }
-      setViewport((vp) => ({
-        ...vp,
-        panX: panDragRef.current.origPanX + dx,
-        panY: panDragRef.current.origPanY + dy,
-      }));
+      if (panDragRef.current.moved) {
+        setViewport((vp) => ({
+          ...vp,
+          panX: panDragRef.current.origPanX + dx,
+          panY: panDragRef.current.origPanY + dy,
+        }));
+      }
       return;
     }
 
@@ -7213,7 +7490,9 @@ function App() {
       sy,
       currentVp,
       currentModel.nodes,
-      currentModel.elements
+      currentModel.elements,
+      16,
+      12
     );
     setSnapTarget(currentSnap);
 
@@ -7224,11 +7503,9 @@ function App() {
   };
 
   const handleCanvasMouseUp = (e     ) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
+    const coords = getCanvasCssCoords(e);
+    if (!coords) return;
+    const { sx, sy } = coords;
     const currentVp = viewportRef.current;
     const currentModel = modelRef.current;
     const currentTool = activeToolRef.current;
@@ -7237,37 +7514,48 @@ function App() {
       const wasMoved = panDragRef.current.moved;
       panDragRef.current.active = false;
       if (!wasMoved && currentTool === 'select') {
-        setSelectedNodeId(null);
-        setSelectedElementId(null);
-        setSelectedLoadId(null);
+        clearSelection();
       }
       return;
     }
 
-    // Support click-and-drag release in Draw Member mode (when dragged >= 0.1 m away from start)
+    // Support click-and-drag release in Draw Member mode (when dragged >= 0.15 m away from start)
     const activeStart = drawStartPointRef.current;
-    if (currentTool === 'draw_member' && activeStart) {
+    if (currentTool === 'draw_member' && activeStart && e.button === 0) {
       const currentSnap = computeSmartSnap(
         sx,
         sy,
         currentVp,
         currentModel.nodes,
-        currentModel.elements
+        currentModel.elements,
+        16,
+        12
       );
-      if (Math.hypot(currentSnap.x - activeStart.x, currentSnap.y - activeStart.y) >= 0.09) {
-        completeDrawMember(activeStart, currentSnap);
+      if (Math.hypot(currentSnap.x - activeStart.x, currentSnap.y - activeStart.y) >= 0.15) {
+        let createdElId                = null;
+        let failReason                    ;
+        updateModelWithHistory((prev) => {
+          const endRes = addNodeAtSnap(prev, currentSnap);
+          const memRes = addMemberBetweenNodes(endRes.model, activeStart.nodeId, endRes.nodeId);
+          createdElId = memRes.elementId;
+          failReason = memRes.reason;
+          return memRes.model;
+        });
         setDrawStartPoint(null);
+        if (createdElId) {
+          showToast(`Created Member ${createdElId}`);
+        } else if (failReason) {
+          showToast(failReason);
+        }
       }
     }
   };
 
   const handleCanvasWheel = (e     ) => {
     e.preventDefault();
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
+    const coords = getCanvasCssCoords(e);
+    if (!coords) return;
+    const { sx, sy } = coords;
 
     const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
     setViewport((vp) => {
@@ -7595,6 +7883,9 @@ function App() {
     React.createElement("div", { "className": "flex flex-col w-screen h-screen bg-slate-50 text-slate-900 overflow-hidden font-sans" }, React.createElement(Toolbar, { "activePresetId": activePresetId, "onSelectPreset": handleSelectPreset, "onNewProject": handleNewBlankProject, "activeTool": activeTool, "onSelectTool": (t) => {
           setActiveTool(t);
           setDrawStartPoint(null);
+          if (t === 'add_node' || t === 'draw_member' || t === 'assign_support' || t === 'delete') {
+            clearSelection();
+          }
         }, "canUndo": undoStack.length > 0, "canRedo": redoStack.length > 0, "onUndo": handleUndo, "onRedo": handleRedo, "onExportJson": handleExportJson, "onImportJson": handleImportJson, "onZoomIn": () =>
           setViewport((vp) => ({ ...vp, zoom: Math.min(280, vp.zoom * 1.2) }))
         , "onZoomOut": () =>
@@ -7605,38 +7896,36 @@ function App() {
             coordSystem: vp.coordSystem === 'cartesian' ? 'polar' : 'cartesian',
           }))
         , "solverOutput": solverOutput, "model": model }), React.createElement("main", { "className": "flex flex-1 min-h-0 relative overflow-hidden" }, React.createElement("div", { "ref": containerRef, "className": "relative flex-1 h-full overflow-hidden bg-white", "onContextMenu": (e     ) => e.preventDefault() }, React.createElement(LayerTogglesBar, { "layers": layers, "onUpdateLayers": (patch) => setLayers((l) => ({ ...l, ...patch })), "hoverProbe": hoverProbe }), !solverOutput.stable ? (
-            React.createElement("div", { "id": "unstable-structure-banner", "className": "absolute top-16 left-3 z-20 max-w-lg bg-red-50/95 border border-red-300 text-red-900 px-3.5 py-2 rounded-lg shadow-lg text-xs" }, React.createElement("div", { "className": "font-bold text-red-700 uppercase tracking-wide mb-0.5" }, "Unstable Structure — Mechanism or Insufficient Restraints"), React.createElement("div", { "className": "text-red-600 font-mono text-[11px]" }, solverOutput.instabilityReason ||
+            React.createElement("div", { "id": "unstable-structure-banner", "className": "absolute top-16 left-3 z-20 max-w-lg bg-red-50/95 border border-red-300 text-red-900 px-3.5 py-2 rounded-lg shadow-lg text-xs pointer-events-none" }, React.createElement("div", { "className": "font-bold text-red-700 uppercase tracking-wide mb-0.5" }, "Unstable Structure — Mechanism or Insufficient Restraints"), React.createElement("div", { "className": "text-red-600 font-mono text-[11px]" }, solverOutput.instabilityReason ||
                   'Add supports, springs, or restrain free hinge mechanisms to restore stability.'))
           ) : null, toastMessage ? (
-            React.createElement("div", { "className": "absolute top-16 right-4 z-30 bg-white/95 border border-blue-300 text-blue-800 px-3 py-1.5 rounded-lg shadow-md text-xs font-mono" }, toastMessage)
+            React.createElement("div", { "className": "absolute top-16 right-4 z-30 bg-white/95 border border-blue-300 text-blue-800 px-3 py-1.5 rounded-lg shadow-md text-xs font-mono pointer-events-none" }, toastMessage)
           ) : null, React.createElement("canvas", { "id": "structural-fem-canvas", "ref": canvasRef, "onMouseDown": handleCanvasMouseDown, "onMouseMove": handleCanvasMouseMove, "onMouseUp": handleCanvasMouseUp, "onWheel": handleCanvasWheel, "style": {
               width: `${viewport.width}px`,
               height: `${viewport.height}px`,
             }, "className": `block select-none ${
-              activeTool === 'draw_member'
+              activeTool === 'draw_member' || activeTool === 'add_node'
                 ? 'cursor-crosshair'
-                : activeTool === 'delete' || activeTool === 'assign_support'
+                : activeTool === 'delete' || activeTool === 'assign_support' || activeTool === 'add_nodal_load' || activeTool === 'add_member_load'
                   ? 'cursor-pointer'
                   : 'cursor-default'
-            }` }), React.createElement(ContextualPopup, { "model": model, "selectedNodeId": selectedNodeId, "selectedElementId": selectedElementId, "selectedLoadId": selectedLoadId, "onUpdateModel": updateModelWithHistory, "onClose": () => {
-              setSelectedNodeId(null);
-              setSelectedElementId(null);
-              setSelectedLoadId(null);
-            }, "onDeleteEntity": handleDeleteSelected, "onPinParameter": handlePinParameter, "onQuickAddMemberLoad": handleQuickAddMemberLoad, "onQuickAddNodalLoad": handleQuickAddNodalLoad, "onSelectEntity": handleSelectEntity }), React.createElement("div", { "className": "absolute bottom-0 inset-x-0 h-7 bg-white/95 backdrop-blur border-t border-slate-200 px-3 flex items-center justify-between text-[11px] font-mono text-slate-600 select-none pointer-events-none" }, React.createElement("div", { "className": "flex items-center gap-4" }, React.createElement("span", { "className": "text-blue-700 font-semibold" }, snapTarget
+            }` }), React.createElement(ContextualPopup, { "model": model, "selectedNodeId": selectedNodeId, "selectedElementId": selectedElementId, "selectedLoadId": selectedLoadId, "onUpdateModel": updateModelWithHistory, "onClose": clearSelection, "onDeleteEntity": handleDeleteSelected, "onPinParameter": handlePinParameter, "onQuickAddMemberLoad": handleQuickAddMemberLoad, "onQuickAddNodalLoad": handleQuickAddNodalLoad, "onSelectEntity": handleSelectEntity }), React.createElement("div", { "className": "absolute bottom-0 inset-x-0 h-7 bg-white/95 backdrop-blur border-t border-slate-200 px-3 flex items-center justify-between text-[11px] font-mono text-slate-600 select-none pointer-events-none" }, React.createElement("div", { "className": "flex items-center gap-4" }, React.createElement("span", { "className": "text-blue-700 font-semibold" }, snapTarget
                   ? `X: ${snapTarget.x.toFixed(1)} m, Y: ${snapTarget.y.toFixed(1)} m (Z: 0.0 m)`
                   : 'X: 0.0 m, Y: 0.0 m'), React.createElement("span", { "className": "hidden sm:inline text-slate-300" }, "|"), React.createElement("span", { "className": "hidden sm:inline text-slate-600" }, activeTool === 'select'
-                  ? 'Click any Member, Node, or Load to edit (click repeatedly on busy node to cycle) · Drag background to pan'
-                  : activeTool === 'draw_member'
-                    ? drawStartPoint
-                      ? 'Click or release on end point (snaps to 0.1m grid, existing nodes, or T-splits members)'
-                      : 'Click or drag from start point to draw new 1D Frame Member'
-                    : activeTool === 'assign_support'
-                      ? 'Click any node (16 px radius) to cycle support: Pinned → Fixed → Roller X → Roller Y → None'
-                      : activeTool === 'add_nodal_load'
-                        ? 'Click any node to add a concentrated Nodal Load'
-                        : activeTool === 'add_member_load'
-                          ? 'Click any member to add a Distributed (UDL/Trapezoidal) or Point Load'
-                          : 'Click any Member, Node, or Load to delete it')), React.createElement("div", { "className": "flex items-center gap-3 text-slate-500" }, React.createElement("span", null, "Nodes: ", model.nodes.length), React.createElement("span", null, "Members: ", model.elements.length), React.createElement("span", null, "Loads: ", model.loads.length), React.createElement("span", null, "Grid: 0.1 m")))), React.createElement(SensitivityPanel, { "model": model, "solverOutput": solverOutput, "layers": layers, "onUpdateLayers": (patch) => setLayers((l) => ({ ...l, ...patch })), "pinnedParams": pinnedParams, "onSlidePinnedParam": handleSlidePinnedParam, "onUnpinParam": (pinId) =>
+                  ? 'Click any Member, Node, or Load to edit (click repeatedly on busy node to cycle) · Drag empty space to pan'
+                  : activeTool === 'add_node'
+                    ? 'Click empty 0.1 m grid to create Node, or click on an existing Member to split it with a new Node'
+                    : activeTool === 'draw_member'
+                      ? drawStartPoint
+                        ? `Start locked at Node ${drawStartPoint.nodeId} · Click end point to create Member (Esc or Right-Click to cancel)`
+                        : 'Click start point (node, 0.1m grid, or member) to begin drawing a 1D Frame Member'
+                      : activeTool === 'assign_support'
+                        ? 'Click within 16 px of any node to cycle support: Pinned → Fixed → Roller X → Roller Y → None'
+                        : activeTool === 'add_nodal_load'
+                          ? 'Click within 16 px of any node to attach a concentrated Nodal Load (Fx, Fy, Mz)'
+                          : activeTool === 'add_member_load'
+                            ? 'Click any member to add a Distributed (UDL/Trapezoidal) or Point Load'
+                            : 'Click any Member, Node, or Load to delete it')), React.createElement("div", { "className": "flex items-center gap-3 text-slate-500" }, React.createElement("span", null, "Nodes: ", model.nodes.length), React.createElement("span", null, "Members: ", model.elements.length), React.createElement("span", null, "Loads: ", model.loads.length), React.createElement("span", null, "Grid: 0.1 m")))), React.createElement(SensitivityPanel, { "model": model, "solverOutput": solverOutput, "layers": layers, "onUpdateLayers": (patch) => setLayers((l) => ({ ...l, ...patch })), "pinnedParams": pinnedParams, "onSlidePinnedParam": handleSlidePinnedParam, "onUnpinParam": (pinId) =>
             setPinnedParams((prev) => prev.filter((p) => p.id !== pinId))
           , "onResetPinnedParams": handleResetPinnedParams, "onAddQuickPin": handlePinParameter, "onSelectEntity": handleSelectEntity, "onCollapseChange": () => {
             setTimeout(() => {
@@ -7646,8 +7935,8 @@ function App() {
               if (rect.width > 0 && rect.height > 0) {
                 setViewport((vp) => ({
                   ...vp,
-                  width: rect.width,
-                  height: rect.height,
+                  width: Math.round(rect.width),
+                  height: Math.round(rect.height),
                 }));
               }
             }, 0);

@@ -6,6 +6,9 @@ import {
   probeMemberAtCursor,
   findNodeWithinRadius,
   hitTestAllCanvasEntities,
+  addNodeAtSnap,
+  addMemberBetweenNodes,
+  cycleNodeSupport,
 } from '../src/utils/geometry.ts';
 import {
   polarToCartesian,
@@ -42,6 +45,92 @@ test('T-Junction Mid-Span Member Auto-Splitting Preserves Equilibrium and Splits
   assert.equal(dupCheck.valid, false);
   const zeroCheck = canAddMember(splitModel, newNodeId, newNodeId);
   assert.equal(zeroCheck.valid, false);
+});
+
+test('Interactive CAD Workflow: (a) Add Standalone Node, (b) Add Mid-Span Node to Split Beam, (c) Draw Member Between Nodes, and (d) Assign Support & Solve Reactions', () => {
+  let model = createContinuousBeamPreset();
+  const vp = fitModelToViewport(model.nodes, 1000, 700);
+  const initialNodeCount = model.nodes.length;
+  const initialElementCount = model.elements.length;
+
+  // (a) Add a standalone node at empty 0.1 m grid coordinate (3.0 m, -2.5 m)
+  const standaloneScreen = worldToScreen({ x: 3.0, y: -2.5 }, vp);
+  const standaloneSnap = computeSmartSnap(
+    standaloneScreen.sx,
+    standaloneScreen.sy,
+    vp,
+    model.nodes,
+    model.elements
+  );
+  assert.equal(standaloneSnap.kind, 'grid');
+  assert.equal(standaloneSnap.x, 3.0);
+  assert.equal(standaloneSnap.y, -2.5);
+
+  const stepA = addNodeAtSnap(model, standaloneSnap);
+  assert.equal(stepA.created, true);
+  assert.equal(stepA.model.nodes.length, initialNodeCount + 1);
+  const standaloneNodeId = stepA.nodeId;
+  model = stepA.model;
+
+  // Clicking the exact same coordinate again does not create a duplicate node
+  const dupStepA = addNodeAtSnap(model, standaloneSnap);
+  assert.equal(dupStepA.created, false);
+  assert.equal(dupStepA.nodeId, standaloneNodeId);
+  assert.equal(dupStepA.model.nodes.length, initialNodeCount + 1);
+
+  // (b) Add a node mid-span on Span 1 (M1 from N1(0,0) to N2(6,0)) at (3.0 m, 0.0 m) to split it
+  const midSpanScreen = worldToScreen({ x: 3.0, y: 0.0 }, vp);
+  const midSpanSnap = computeSmartSnap(
+    midSpanScreen.sx,
+    midSpanScreen.sy + 4, // within 12 px CSS distance of M1
+    vp,
+    model.nodes,
+    model.elements
+  );
+  assert.equal(midSpanSnap.kind, 'member_segment');
+  assert.equal(midSpanSnap.splitElementId, 'M1');
+  assert.equal(midSpanSnap.x, 3.0);
+  assert.equal(midSpanSnap.y, 0.0);
+
+  const stepB = addNodeAtSnap(model, midSpanSnap);
+  assert.equal(stepB.created, true);
+  assert.equal(stepB.splitElementId, 'M1');
+  const midSpanNodeId = stepB.nodeId;
+  model = stepB.model;
+  // M1 was replaced by 2 connected sub-members sharing midSpanNodeId
+  assert.equal(model.elements.length, initialElementCount + 1);
+  const connectedToMid = model.elements.filter(
+    (e) => e.kind === 'frame2d' && (e.nodeI === midSpanNodeId || e.nodeJ === midSpanNodeId)
+  );
+  assert.equal(connectedToMid.length, 2);
+
+  // (c) Draw a new vertical prop member between standaloneNodeId (3.0, -2.5) and midSpanNodeId (3.0, 0.0)
+  const stepC = addMemberBetweenNodes(model, standaloneNodeId, midSpanNodeId);
+  assert.ok(stepC.elementId !== null);
+  model = stepC.model;
+  assert.equal(model.elements.length, initialElementCount + 2);
+
+  // (d) Assign a support to standaloneNodeId (cycling from 'none' -> 'pinned' -> 'fixed') and solve for reactions
+  const sup1 = cycleNodeSupport(model, standaloneNodeId);
+  assert.equal(sup1.nextSupport, 'pinned');
+  model = sup1.model;
+
+  const solvedPinned = analyzeStructure(model);
+  assert.equal(solvedPinned.stable, true);
+  const propReaction = solvedPinned.nodeResults[standaloneNodeId];
+  assert.ok(propReaction !== undefined);
+  assert.equal(propReaction.hasReaction, true);
+  // Prop column carries positive upward vertical reaction Ry > 50 kN under Span 1 UDL
+  assert.ok(
+    propReaction.reactionFy > 50,
+    `Expected positive vertical reaction at prop support ${standaloneNodeId}, got ${propReaction.reactionFy} kN`
+  );
+
+  // Cycling again switches 'pinned' -> 'fixed'
+  const sup2 = cycleNodeSupport(model, standaloneNodeId);
+  assert.equal(sup2.nextSupport, 'fixed');
+  const solvedFixed = analyzeStructure(sup2.model);
+  assert.equal(solvedFixed.stable, true);
 });
 
 test('Polar Coordinate Converter and Smart Snapping', () => {

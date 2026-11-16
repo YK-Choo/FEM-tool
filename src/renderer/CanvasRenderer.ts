@@ -59,7 +59,14 @@ export interface RenderLayerOptions {
 }
 
 export interface CanvasInteractionState {
-  activeTool: 'select' | 'draw_member' | 'assign_support' | 'add_nodal_load' | 'add_member_load' | 'delete';
+  activeTool:
+    | 'select'
+    | 'add_node'
+    | 'draw_member'
+    | 'assign_support'
+    | 'add_nodal_load'
+    | 'add_member_load'
+    | 'delete';
   selectedNodeId: string | null;
   selectedElementId: string | null;
   selectedLoadId: string | null;
@@ -308,6 +315,41 @@ export class CanvasRenderer {
     return typeof offscreenCanvas.toDataURL === 'function'
       ? offscreenCanvas.toDataURL('image/png')
       : '';
+  }
+
+  /**
+   * Render onto a live HTMLCanvasElement while isolating `devicePixelRatio` backing-store
+   * scaling strictly inside CanvasRenderer so all UI/pointer coordinates remain in CSS pixels.
+   */
+  public renderToCanvas(
+    canvas: HTMLCanvasElement,
+    vp: ViewportTransform,
+    model: StructuralModel,
+    solverOutput: SolverOutput,
+    layers: RenderLayerOptions,
+    interaction: CanvasInteractionState
+  ): LoadScreenHandle[] {
+    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const targetW = Math.max(1, Math.round(vp.width * dpr));
+    const targetH = Math.max(1, Math.round(vp.height * dpr));
+
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return [];
+
+    ctx.save();
+    if (typeof ctx.setTransform === 'function') {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    } else {
+      ctx.scale(dpr, dpr);
+    }
+    const handles = this.render(ctx, vp, model, solverOutput, layers, interaction);
+    ctx.restore();
+    return handles;
   }
 
   public render(
@@ -1445,50 +1487,93 @@ export class CanvasRenderer {
       ctx.restore();
     }
 
-    // 2. Smart Snap cursor indicator
-    if (snapTarget && activeTool !== 'select') {
+    // 2. Clear Visual Hover Snap Indicators:
+    // - Always draw a distinct highlight ring + crosshair whenever cursor hovers near an
+    //   existing node (< 16 px CSS radius) or an existing member segment (< 12 px CSS distance)
+    // - Also draw the 0.1 m grid snap crosshair + ring when Add Node or Draw Member is active
+    if (snapTarget) {
       ctx.save();
       if (snapTarget.kind === 'node') {
         ctx.strokeStyle = '#0f766e';
-        ctx.fillStyle = 'rgba(15, 118, 110, 0.14)';
-        ctx.lineWidth = 2;
+        ctx.fillStyle = 'rgba(15, 118, 110, 0.16)';
+        ctx.lineWidth = 2.2;
         ctx.beginPath();
-        ctx.arc(snapTarget.sx, snapTarget.sy, 10, 0, Math.PI * 2);
+        ctx.arc(snapTarget.sx, snapTarget.sy, 11, 0, Math.PI * 2);
         ctx.fill();
         ctx.stroke();
+
+        // Precision crosshair ticks around hovered node
+        ctx.beginPath();
+        ctx.moveTo(snapTarget.sx - 15, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx - 7, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx + 7, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx + 15, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy - 15);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy - 7);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy + 7);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy + 15);
+        ctx.stroke();
+
+        if (activeTool !== 'select') {
+          drawRoundedBadge(
+            ctx,
+            `Snap Node ${snapTarget.nodeId} (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
+            snapTarget.sx,
+            snapTarget.sy - 22,
+            'rgba(255, 255, 255, 0.94)',
+            '#0f766e',
+            '#0f766e',
+            '600 10px "JetBrains Mono", ui-monospace, monospace'
+          );
+        }
       } else if (snapTarget.kind === 'member_segment') {
-        // Diamond T-junction split indicator
+        // Diamond + crosshair mid-member snap / T-junction split indicator (< 12 px CSS distance)
         ctx.strokeStyle = '#d97706';
-        ctx.fillStyle = 'rgba(217, 119, 6, 0.2)';
+        ctx.fillStyle = 'rgba(217, 119, 6, 0.22)';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(snapTarget.sx, snapTarget.sy - 8);
-        ctx.lineTo(snapTarget.sx + 8, snapTarget.sy);
-        ctx.lineTo(snapTarget.sx, snapTarget.sy + 8);
-        ctx.lineTo(snapTarget.sx - 8, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy - 9);
+        ctx.lineTo(snapTarget.sx + 9, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy + 9);
+        ctx.lineTo(snapTarget.sx - 9, snapTarget.sy);
         ctx.closePath();
         ctx.fill();
         ctx.stroke();
 
-        drawRoundedBadge(
-          ctx,
-          `T-Split ${snapTarget.splitElementId} (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
-          snapTarget.sx,
-          snapTarget.sy - 20,
-          'rgba(255, 255, 255, 0.94)',
-          '#d97706',
-          '#b45309',
-          '600 10px "JetBrains Mono", ui-monospace, monospace'
-        );
-      } else {
-        // 0.1m Grid snap crosshair
-        ctx.strokeStyle = '#2563eb';
-        ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.moveTo(snapTarget.sx - 6, snapTarget.sy);
-        ctx.lineTo(snapTarget.sx + 6, snapTarget.sy);
-        ctx.moveTo(snapTarget.sx, snapTarget.sy - 6);
-        ctx.lineTo(snapTarget.sx, snapTarget.sy + 6);
+        ctx.moveTo(snapTarget.sx - 13, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx + 13, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy - 13);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy + 13);
+        ctx.stroke();
+
+        if (activeTool === 'add_node' || activeTool === 'draw_member') {
+          drawRoundedBadge(
+            ctx,
+            `Split ${snapTarget.splitElementId} (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
+            snapTarget.sx,
+            snapTarget.sy - 22,
+            'rgba(255, 255, 255, 0.94)',
+            '#d97706',
+            '#b45309',
+            '600 10px "JetBrains Mono", ui-monospace, monospace'
+          );
+        }
+      } else if (activeTool === 'add_node' || activeTool === 'draw_member') {
+        // 0.1m Grid snap ring + crosshair for Add Node and Draw Member
+        ctx.strokeStyle = '#2563eb';
+        ctx.fillStyle = 'rgba(37, 99, 235, 0.12)';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.arc(snapTarget.sx, snapTarget.sy, 6.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(snapTarget.sx - 10, snapTarget.sy);
+        ctx.lineTo(snapTarget.sx + 10, snapTarget.sy);
+        ctx.moveTo(snapTarget.sx, snapTarget.sy - 10);
+        ctx.lineTo(snapTarget.sx, snapTarget.sy + 10);
         ctx.stroke();
 
         if (vp.coordSystem === 'polar') {
@@ -1502,6 +1587,17 @@ export class CanvasRenderer {
             '#2563eb',
             '#1d4ed8',
             '500 10px "JetBrains Mono", ui-monospace, monospace'
+          );
+        } else if (activeTool === 'add_node') {
+          drawRoundedBadge(
+            ctx,
+            `+Node (${snapTarget.x.toFixed(1)}, ${snapTarget.y.toFixed(1)} m)`,
+            snapTarget.sx,
+            snapTarget.sy - 20,
+            'rgba(255, 255, 255, 0.94)',
+            '#2563eb',
+            '#1d4ed8',
+            '600 10px "JetBrains Mono", ui-monospace, monospace'
           );
         }
       }

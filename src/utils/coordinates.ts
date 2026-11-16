@@ -123,9 +123,9 @@ export interface SnapResult {
 }
 
 /**
- * Smart CAD cursor snapping:
- * 1. Snaps to existing nodes within nodeSnapPx (default 15px).
- * 2. Snaps along existing 1D member segments within segmentSnapPx (default 11px),
+ * Smart CAD cursor snapping (strictly in CSS pixels):
+ * 1. Snaps to existing nodes within nodeSnapPx (default 16 px CSS radius).
+ * 2. Snaps along existing 1D member segments within segmentSnapPx (default 12 px CSS distance),
  *    enabling automatic T-junction member splitting at mid-span connections.
  * 3. Snaps to the 0.1 m Cartesian grid.
  */
@@ -135,8 +135,8 @@ export function computeSmartSnap(
   vp: ViewportTransform,
   nodes: StructuralNode[],
   elements: StructuralElement[],
-  nodeSnapPx: number = 15,
-  segmentSnapPx: number = 11
+  nodeSnapPx: number = 16,
+  segmentSnapPx: number = 12
 ): SnapResult {
   const nodeMap = new Map<string, StructuralNode>();
   for (const n of nodes) nodeMap.set(n.id, n);
